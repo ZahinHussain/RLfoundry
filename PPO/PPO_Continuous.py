@@ -1,0 +1,414 @@
+
+import random
+import time
+import os
+
+import hydra
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.tensorboard import SummaryWriter
+from urllib3.filepost import writer
+
+from RLFoundry.PPO import Agent
+from RLFoundry.PPO.temp import SAVE_INTERVAL_SECONDS
+from RLFoundry.env.env import make_vec_env
+
+from RLFoundry.Utils.checkpoint import create_folder_checkpoint ,create_timestamp_folder
+
+def train(cfg,path):
+
+
+
+    # create the folders needed
+    path = create_folder_checkpoint(path,cfg.exp_name)
+    path =create_timestamp_folder(path)
+
+
+    # save cfg
+
+
+    txt_file_path = os.path.join(path, "config.txt")
+
+    with open(txt_file_path, "w") as f:
+        f.write(f"# Config saved for experiment: {cfg.exp_name}\n")
+        f.write("=" * 40 + "\n")
+        for key, value in cfg.items():
+            line = f"{key}: {value}"
+            print(line)
+            f.write(line + "\n")
+
+
+    #variables needed
+
+    SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
+    last_numpy_save_t = time.time()
+    start_time = time.time()
+
+
+
+
+    run_name = f"{cfg.exp_name}__{cfg.seed}__{int(time.time())}"
+
+
+
+    writer = SummaryWriter(f"runs/{run_name}")
+
+
+
+
+
+
+    # Algorithm parameter and set up
+
+
+    # TRY NOT TO MODIFY: seeding
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
+    # ==================================================
+    # PPO TRAINING CODE GOES HERE
+    # ==================================================
+
+
+
+    # Cude
+    device = torch.device("cuda" if torch.cuda.is_available()  else "cpu")
+
+
+    # env setup
+    envs = make_vec_env(cfg.gym_id, cfg.num_envs, cfg.gamma, cfg.seed)
+
+
+
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+
+    agent = Agent(envs).to(device)
+
+    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
+
+    # ---- pre-allocated storage for one rollout's worth of data ----
+    # [LINE 3] this is where D_k actually lives, as plain tensors rather
+    # than a list of trajectory objects — much faster on GPU
+    obs = torch.zeros((cfg.num_steps, cfg.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((cfg.num_steps, cfg.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
+    rewards = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
+    dones = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
+    values = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
+
+    global_step = 0
+    next_obs, _ = envs.reset(seed=cfg.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
+    next_done = torch.zeros(cfg.num_envs).to(device)
+
+
+    start_time = time.time()
+
+
+
+    # ========================================================================
+    # [LINE 2] OUTER LOOP — one iteration = one full "collect, then update" cycle
+    # ========================================================================
+    for iteration in range(1, cfg.num_iterations + 1):
+
+        if cfg.anneal_lr:
+            # [EXTRA] linearly shrink the learning rate as training progresses
+            frac = 1.0 - (iteration - 1.0) / cfg.num_iterations
+            optimizer.param_groups[0]["lr"] = frac * cfg.learning_rate
+
+        # ====================================================================
+        # [LINE 3] "Collect set of trajectories D_k by running policy pi_k"
+        # ====================================================================
+        for step in range(0, cfg.num_steps):
+            global_step += cfg.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
+
+            # no_grad: we are NOT training right now, just acting in the
+            # environment and recording what happens. Gradients only get
+            # computed later, during the update phase.
+            with torch.no_grad():
+                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                values[step] = value.flatten()
+
+            actions[step] = action
+            logprobs[step] = logprob
+
+            # step the actual environment forward
+            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_done = np.logical_or(terminations, truncations)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.Tensor(next_done).to(device)
+
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+
+        # ====================================================================
+        # [LINE 4 + 5] "Compute rewards-to-go" + "Compute advantage estimates"
+        #
+        # NOTE: this implementation computes them TOGETHER via GAE, which is
+        # a deviation from the pseudocode worth naming explicitly in your
+        # dissertation. Spinning Up's pseudocode treats rewards-to-go as a
+        # Monte Carlo target computed independently of advantages. CleanRL
+        # (like most modern PPO code) instead computes GAE advantages first,
+        # THEN derives the value-function target as returns = advantages + values.
+        # This is lower-variance and is the de facto standard, but it's
+        # technically GAE-PPO, not literal vanilla PPO-Clip.
+        # ====================================================================
+        with torch.no_grad():
+            next_value = agent.get_value(next_obs).reshape(1, -1)
+            advantages = torch.zeros_like(rewards).to(device)
+            lastgaelam = 0
+
+            # walk BACKWARD through the rollout — this is the standard GAE
+            # recursive computation, equivalent to (but far cheaper than)
+            # summing an infinite series of discounted TD errors
+            for t in reversed(range(cfg.num_steps)):
+                if t == cfg.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = values[t + 1]
+
+                # TD error / "surprise" at this timestep:
+                # actual reward + discounted next value, minus what we predicted
+                delta = rewards[t] + cfg.gamma * nextvalues * nextnonterminal - values[t]
+
+                # GAE: exponentially-weighted sum of TD errors going forward,
+                # computed efficiently backward
+                advantages[t] = lastgaelam = (
+                        delta + cfg.gamma * cfg.gae_lambda * nextnonterminal * lastgaelam
+                )
+
+            # [LINE 4] the value function's regression TARGET — this stands
+            # in for "rewards-to-go" in the pseudocode
+            returns = advantages + values
+
+        # flatten (num_steps, num_envs, ...) -> (num_steps * num_envs, ...)
+        # so all parallel environments' data gets mixed together into one
+        # big pool for minibatching
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+
+        # ====================================================================
+        # [LINE 6 + 7] "Update the policy by maximizing PPO-Clip objective"
+        #              "Fit value function by regression on MSE"
+        #
+        # These happen TOGETHER, in the same loop, on the same minibatches,
+        # combined into one scalar loss per minibatch. The pseudocode lists
+        # them as two separate steps, but in practice they share one
+        # optimizer and one backward pass for efficiency.
+        # ====================================================================
+        b_inds = np.arange(cfg.batch_size)
+        for epoch in range(cfg.update_epochs):
+            # reshuffle which data goes in which minibatch every epoch —
+            # standard SGD practice, prevents the network from learning
+            # spurious orderings
+            np.random.shuffle(b_inds)
+
+            for start in range(0, cfg.batch_size, cfg.minibatch_size):
+                end = start + cfg.minibatch_size
+                mb_inds = b_inds[start:end]
+
+                # re-run the CURRENT (possibly already-updated-this-epoch)
+                # policy on the OLD states/actions, to get a fresh log-prob
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions[mb_inds]
+                )
+
+                # ---- THE CORE PPO RATIO ----
+                # log(pi_new) - log(pi_old), exponentiated -> pi_new/pi_old
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                mb_advantages = b_advantages[mb_inds]
+                if cfg.norm_adv:
+                    # FIX: Added correction=0 to prevent NaN when minibatch size is 1
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std(correction=0) + 1e-8)
+                # ---- [LINE 6] THE PPO-CLIP OBJECTIVE ITSELF ----
+                # Spinning Up's formula:
+                #   L = min( ratio * A_hat,  clip(ratio, 1-eps, 1+eps) * A_hat )
+                # We want to MAXIMIZE this, but PyTorch optimizers MINIMIZE,
+                # so everything below is negated (hence -mb_advantages and
+                # torch.max instead of torch.min — negating min(a,b) gives
+                # max(-a,-b))
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # ---- [LINE 8] VALUE FUNCTION MSE REGRESSION ----
+                newvalue = newvalue.view(-1)
+                if cfg.clip_vloss:
+                    # [EXTRA] clipped value loss — not in pseudocode, but
+                    # mirrors the policy clip: don't let the value estimate
+                    # move too far from its old value in one update
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds], -cfg.clip_coef, cfg.clip_coef
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    # plain MSE — this is the literal pseudocode line 8
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                # [EXTRA] entropy bonus — encourages exploration, not in
+                # pseudocode at all
+                entropy_loss = entropy.mean()
+
+                # ---- COMBINE EVERYTHING INTO ONE LOSS ----
+                # policy loss MINUS entropy bonus (we want to ENCOURAGE
+                # entropy, hence the minus sign on a term we're minimizing)
+                # PLUS value loss weighted by vf_coef
+                loss = pg_loss - cfg.ent_coef * entropy_loss + v_loss * cfg.vf_coef
+
+                optimizer.zero_grad()
+                loss.backward()
+                # [EXTRA] clip gradients so no single update is too violent
+                nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+
+            # [EXTRA] optional early stopping if policy is changing too fast
+
+            ''''
+             
+            if cfg.target_kl is not None and approx_kl > cfg.target_kl:
+                break
+                '''
+
+        now = time.time()
+        if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
+            save_checkpoint(
+                path,
+                global_step,
+                agent,
+                optimizer,
+                obs=obs.cpu().numpy(),
+                actions=actions.cpu().numpy(),
+                logprobs=logprobs.cpu().numpy(),
+                rewards=rewards.cpu().numpy(),
+                dones=dones.cpu().numpy(),
+                values=values.cpu().numpy(),
+                returns=returns.cpu().numpy(),
+                advantages=advantages.cpu().numpy(),
+            )
+
+
+
+
+
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+
+
+
+        print("SPS:", int(global_step / (time.time() - start_time)))
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    save_checkpoint(
+        path,
+        global_step,
+        agent,
+        optimizer,
+        obs=obs.cpu().numpy(),
+        actions=actions.cpu().numpy(),
+        logprobs=logprobs.cpu().numpy(),
+        rewards=rewards.cpu().numpy(),
+        dones=dones.cpu().numpy(),
+        values=values.cpu().numpy(),
+        returns=returns.cpu().numpy(),
+        advantages=advantages.cpu().numpy(),
+    )
+
+    envs.close()
+
+
+
+def save_model(self, path):
+    checkpoint = {
+        "agent": self.agent.state_dict(),
+        "optimizer": self.optimizer.state_dict(),
+        "episode_rewards": getattr(self, "episode_rewards", []),
+        "step_rewards": getattr(self, "step_rewards", []),
+        "global_step": getattr(self, "global_step", 0),
+    }
+    torch.save(checkpoint, path)
+
+
+
+
+
+def save_checkpoint(
+    save_dir: str,
+    global_step: int,
+    agent,
+    optimizer,
+    **arrays: np.ndarray,
+) -> None:
+    """
+    Save rollout arrays and model checkpoint.
+    """
+
+    # Save numpy arrays
+    step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
+    os.makedirs(step_dir, exist_ok=True)
+
+    for name, arr in arrays.items():
+        np.save(os.path.join(step_dir, f"{name}.npy"), arr)
+
+    print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
+
+    # Save model
+    model_dir = os.path.join(save_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    model_path = os.path.join(
+        model_dir,
+        f"ppo_step_{global_step}.pt"
+    )
+
+    checkpoint = {
+        "agent_state_dict": agent.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "global_step": global_step,
+    }
+
+    torch.save(checkpoint, model_path)
+
+    print(f"[model checkpoint] saved -> {model_path}")
+
+
+@hydra.main(
+    version_base=None,
+    config_path="configs",
+    config_name="config",
+)
+
+
+
+
+def main(cfg: DictConfig):
+    train(cfg)
+
+
+
+
+
+if __name__ == "__main__":
+    main()
