@@ -1,4 +1,3 @@
-
 import random
 import time
 import os
@@ -13,56 +12,21 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 from urllib3.filepost import writer
 
-from RLFoundry.PPO import Agent
-from RLFoundry.PPO.temp import SAVE_INTERVAL_SECONDS
-from RLFoundry.env.env import make_vec_env
-
-from RLFoundry.Utils.checkpoint import create_folder_checkpoint ,create_timestamp_folder
-
-def train(cfg,path):
+from gymnasium.wrappers import FlattenObservation
+from RLfoundry.PPO.Agent import Agent
+from RLfoundry.Utils.run_startup import run_startup
 
 
-
-    # create the folders needed
-    path = create_folder_checkpoint(path,cfg.exp_name)
-    path =create_timestamp_folder(path)
+from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
 
-    # save cfg
+def train(cfg,env, path):
 
-
-    txt_file_path = os.path.join(path, "config.txt")
-
-    with open(txt_file_path, "w") as f:
-        f.write(f"# Config saved for experiment: {cfg.exp_name}\n")
-        f.write("=" * 40 + "\n")
-        for key, value in cfg.items():
-            line = f"{key}: {value}"
-            print(line)
-            f.write(line + "\n")
-
-
-    #variables needed
+    #run startup
+    path = run_startup(path,cfg)
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
-    start_time = time.time()
-
-
-
-
-    run_name = f"{cfg.exp_name}__{cfg.seed}__{int(time.time())}"
-
-
-
-    writer = SummaryWriter(f"runs/{run_name}")
-
-
-
-
-
-
-    # Algorithm parameter and set up
 
 
     # TRY NOT TO MODIFY: seeding
@@ -74,40 +38,25 @@ def train(cfg,path):
     # PPO TRAINING CODE GOES HERE
     # ==================================================
 
-
-
-    # Cude
-    device = torch.device("cuda" if torch.cuda.is_available()  else "cpu")
-
-
-    # env setup
-    envs = make_vec_env(cfg.gym_id, cfg.num_envs, cfg.gamma, cfg.seed)
-
-
-
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-
-    agent = Agent(envs).to(device)
-
-    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
+    # Cude and device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = Agent(env).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
 
     # ---- pre-allocated storage for one rollout's worth of data ----
-    # [LINE 3] this is where D_k actually lives, as plain tensors rather
-    # than a list of trajectory objects — much faster on GPU
-    obs = torch.zeros((cfg.num_steps, cfg.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((cfg.num_steps, cfg.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
-    rewards = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
-    dones = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
-    values = torch.zeros((cfg.num_steps, cfg.num_envs)).to(device)
+    obs = torch.zeros((cfg.num_steps,) + env.observation_space.shape).to(device)
+    actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
+    logprobs = torch.zeros(cfg.num_steps).to(device)
+    rewards = torch.zeros(cfg.num_steps).to(device)
+    dones = torch.zeros(cfg.num_steps).to(device)
+    values = torch.zeros(cfg.num_steps).to(device)
 
     global_step = 0
-    next_obs, _ = envs.reset(seed=cfg.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(cfg.num_envs).to(device)
-
-
+    next_obs_np, _ = env.reset(seed=cfg.seed)
+    next_obs = torch.tensor(next_obs_np, dtype=torch.float32).to(device)
+    next_done = torch.zeros(1).to(device)
     start_time = time.time()
+
 
 
 
@@ -124,8 +73,9 @@ def train(cfg,path):
         # ====================================================================
         # [LINE 3] "Collect set of trajectories D_k by running policy pi_k"
         # ====================================================================
+
         for step in range(0, cfg.num_steps):
-            global_step += cfg.num_envs
+            global_step += 1
             obs[step] = next_obs
             dones[step] = next_done
 
@@ -135,21 +85,24 @@ def train(cfg,path):
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
-
             actions[step] = action
             logprobs[step] = logprob
 
             # step the actual environment forward
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+
+            action_np = action.detach().cpu().numpy().reshape(-1)  # always gives 1D (act_dim,)
+            action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
+            next_obs, reward, terminations, truncations, info = env.step(action_np)
+
+
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs = torch.Tensor(next_obs).to(device)
-            next_done = torch.Tensor(next_done).to(device)
+            next_done = torch.tensor(next_done, dtype=torch.float32, device=device)
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            if "final_info" in info:
+                if info and "episode" in info:
+                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
 
         # ====================================================================
         # [LINE 4 + 5] "Compute rewards-to-go" + "Compute advantage estimates"
@@ -182,7 +135,6 @@ def train(cfg,path):
                 # TD error / "surprise" at this timestep:
                 # actual reward + discounted next value, minus what we predicted
                 delta = rewards[t] + cfg.gamma * nextvalues * nextnonterminal - values[t]
-
                 # GAE: exponentially-weighted sum of TD errors going forward,
                 # computed efficiently backward
                 advantages[t] = lastgaelam = (
@@ -193,12 +145,20 @@ def train(cfg,path):
             # in for "rewards-to-go" in the pseudocode
             returns = advantages + values
 
-        # flatten (num_steps, num_envs, ...) -> (num_steps * num_envs, ...)
+        obs_space = env.observation_space
+        act_space = env.action_space
+
+        # ---- pre-allocated storage for one rollout's worth of data ----
+        # [LINE 3] this is where D_k actually lives, as plain tensors rather
+        # than a list of trajectory objects — much faster on GPU
+
+
+        # flatten (num_steps, num_env, ...) -> (num_steps * num_env, ...)
         # so all parallel environments' data gets mixed together into one
         # big pool for minibatching
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs.reshape((-1,) + obs_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = actions.reshape((-1,) + act_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -284,7 +244,7 @@ def train(cfg,path):
             # [EXTRA] optional early stopping if policy is changing too fast
 
             ''''
-             
+
             if cfg.target_kl is not None and approx_kl > cfg.target_kl:
                 break
                 '''
@@ -308,18 +268,7 @@ def train(cfg,path):
 
 
 
-
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-
-
-
         print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     save_checkpoint(
         path,
@@ -336,8 +285,7 @@ def train(cfg,path):
         advantages=advantages.cpu().numpy(),
     )
 
-    envs.close()
-
+    env.close()
 
 
 def save_model(self, path):
@@ -351,15 +299,12 @@ def save_model(self, path):
     torch.save(checkpoint, path)
 
 
-
-
-
 def save_checkpoint(
-    save_dir: str,
-    global_step: int,
-    agent,
-    optimizer,
-    **arrays: np.ndarray,
+        save_dir: str,
+        global_step: int,
+        agent,
+        optimizer,
+        **arrays: np.ndarray,
 ) -> None:
     """
     Save rollout arrays and model checkpoint.
@@ -399,15 +344,8 @@ def save_checkpoint(
     config_path="configs",
     config_name="config",
 )
-
-
-
-
 def main(cfg: DictConfig):
     train(cfg)
-
-
-
 
 
 if __name__ == "__main__":
