@@ -16,18 +16,15 @@ from gymnasium.wrappers import FlattenObservation
 from RLfoundry.PPO.Agent import Agent
 from RLfoundry.Utils.run_startup import run_startup
 
-
 from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
 
-def train(cfg,env, path):
-
-    #run startup
-    path = run_startup(path,cfg)
+def train(cfg, env, path):
+    # run startup
+    path = run_startup(path, cfg)
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
-
 
     # TRY NOT TO MODIFY: seeding
     random.seed(cfg.seed)
@@ -56,9 +53,6 @@ def train(cfg,env, path):
     next_obs = torch.tensor(next_obs_np, dtype=torch.float32).to(device)
     next_done = torch.zeros(1).to(device)
     start_time = time.time()
-
-
-
 
     # ========================================================================
     # [LINE 2] OUTER LOOP — one iteration = one full "collect, then update" cycle
@@ -93,7 +87,6 @@ def train(cfg,env, path):
             action_np = action.detach().cpu().numpy().reshape(-1)  # always gives 1D (act_dim,)
             action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
             next_obs, reward, terminations, truncations, info = env.step(action_np)
-
 
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -151,7 +144,6 @@ def train(cfg,env, path):
         # ---- pre-allocated storage for one rollout's worth of data ----
         # [LINE 3] this is where D_k actually lives, as plain tensors rather
         # than a list of trajectory objects — much faster on GPU
-
 
         # flatten (num_steps, num_env, ...) -> (num_steps * num_env, ...)
         # so all parallel environments' data gets mixed together into one
@@ -265,8 +257,7 @@ def train(cfg,env, path):
                 returns=returns.cpu().numpy(),
                 advantages=advantages.cpu().numpy(),
             )
-
-
+            last_numpy_save_t = now
 
         print("SPS:", int(global_step / (time.time() - start_time)))
 
@@ -286,17 +277,6 @@ def train(cfg,env, path):
     )
 
     env.close()
-
-
-def save_model(self, path):
-    checkpoint = {
-        "agent": self.agent.state_dict(),
-        "optimizer": self.optimizer.state_dict(),
-        "episode_rewards": getattr(self, "episode_rewards", []),
-        "step_rewards": getattr(self, "step_rewards", []),
-        "global_step": getattr(self, "global_step", 0),
-    }
-    torch.save(checkpoint, path)
 
 
 def save_checkpoint(
