@@ -1,5 +1,5 @@
 from .Agent import Agent
-from .PPO_Continuous import  train
+from .ppo_continuous import  train
 
 __all__ = ["Agent", "make_env", "train"]
 

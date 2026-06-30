@@ -1,245 +1,181 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_actionpy
+import copy
 import os
 import random
+import threading
 import time
-from dataclasses import dataclass
 
 import gymnasium as gym
+import hydra
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 import torch.optim as optim
-import tyro
+import torch.nn.functional as F
+import wandb
+
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl_utils.buffers import ReplayBuffer
+from RLfoundry.Utils.Buffer import Buffer
+from RLfoundry.TD3.TD3Network import Actor, QNetwork
+from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
+
+from RLfoundry.Utils.run_startup import run_startup
 
 
-@dataclass
-class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
-    torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
-    track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
-    wandb_entity: str = None
-    """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
+# ==============================================================================
+# Main training loop
+# ==============================================================================
 
-    # Algorithm specific arguments
-    env_id: str = "Hopper-v4"
-    """the id of the environment"""
-    total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
-    buffer_size: int = int(1e6)
-    """the replay memory buffer size"""
-    gamma: float = 0.99
-    """the discount factor gamma"""
-    tau: float = 0.005
-    """target smoothing coefficient (default: 0.005)"""
-    batch_size: int = 256
-    """the batch size of sample from the reply memory"""
-    policy_noise: float = 0.2
-    """the scale of policy noise"""
-    exploration_noise: float = 0.1
-    """the scale of exploration noise"""
-    learning_starts: int = 25e3
-    """timestep to start learning"""
-    policy_frequency: int = 2
-    """the frequency of training policy (delayed)"""
-    noise_clip: float = 0.5
-    """noise clip parameter of the Target Policy Smoothing Regularization"""
+def train(cfg, env, path):
+    # ------------------------------------------------------------------
+    # Config + run naming
+    # ------------------------------------------------------------------
 
+    # run startup
+    path = run_startup(path, cfg)
 
-def make_env(env_id, seed, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.action_space.seed(seed)
-        return env
+    SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
+    last_numpy_save_t = time.time()
 
-    return thunk
+    # ------------------------------------------------------------------
+    # Seeding
+    # ------------------------------------------------------------------
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    torch.backends.cudnn.deterministic = cfg.torch_deterministic
 
+    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
 
-# ALGO LOGIC: initialize agent here:
-class QNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
-        )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
-
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
-
-
-class Actor(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
-        # action rescaling
-        self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.single_action_space.high - env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.single_action_space.high + env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc_mu(x))
-        return x * self.action_scale + self.action_bias
-
-
-if __name__ == "__main__":
-
-    args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-
-    # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
-
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
-    # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-
-    actor = Actor(envs).to(device)
-    qf1 = QNetwork(envs).to(device)
-    qf2 = QNetwork(envs).to(device)
-    qf1_target = QNetwork(envs).to(device)
-    qf2_target = QNetwork(envs).to(device)
-    target_actor = Actor(envs).to(device)
+    # ------------------------------------------------------------------
+    # Networks
+    # Actor + twin Q-networks + target networks (TD3 uses two Q-networks
+    # to reduce overestimation bias; targets are updated via Polyak averaging.
+    # TD3 also maintains a target actor for Target Policy Smoothing)
+    # ------------------------------------------------------------------
+    actor = Actor(env).to(device)
+    qf1 = QNetwork(env).to(device)
+    qf2 = QNetwork(env).to(device)
+    qf1_target = QNetwork(env).to(device)
+    qf2_target = QNetwork(env).to(device)
+    target_actor = Actor(env).to(device)
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
 
-    envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        n_envs=args.num_envs,
-        handle_timeout_termination=False,
+    # Separate optimizers: one for both Q-networks, one for the actor
+    q_optimizer = optim.Adam(
+        list(qf1.parameters()) + list(qf2.parameters()), lr=cfg.learning_rate
     )
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=cfg.learning_rate)
+
+    # ------------------------------------------------------------------
+    # Replay buffer
+    # ------------------------------------------------------------------
+    env.observation_space.dtype = np.float32
+    rb = ReplayBuffer(
+        cfg.buffer_size,
+        env.observation_space,
+        env.action_space,
+        device,
+    )
+
+    # ------------------------------------------------------------------
+    # Checkpoint threading state
+    # ------------------------------------------------------------------
+
+    # Metric history lists (saved as numpy arrays at each checkpoint)
+    qf1_loss_history = []
+    actor_loss_history = []
+    episodic_return_history = []
+
     start_time = time.time()
 
-    # TRY NOT TO MODIFY: start the game
-    obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
-        # ALGO LOGIC: put action logic here
-        if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+    # ==================================================================
+    # Main loop
+    # ==================================================================
+    obs, _ = env.reset(seed=cfg.seed)
+
+    for global_step in range(cfg.total_timesteps):
+
+        # --------------------------------------------------------------
+        # Action selection
+        # Before learning starts: random exploration
+        # After: deterministic actor + Gaussian exploration noise
+        # --------------------------------------------------------------
+        if global_step < cfg.learning_starts:
+            actions = env.action_space.sample()
+
         else:
             with torch.no_grad():
-                actions = actor(torch.Tensor(obs).to(device))
-                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
-                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
+                actions = actor(torch.Tensor(obs).unsqueeze(0).to(device))
+                actions += torch.normal(0, actor.action_scale * cfg.exploration_noise)
+                actions = actions.cpu().numpy().squeeze(0).clip(
+                    env.action_space.low, env.action_space.high
+                )
 
-        # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        # --------------------------------------------------------------
+        # Step environment
+        # --------------------------------------------------------------
+        next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # Log episodic returns when an episode finishes
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    ep_return = info["episode"]["r"]
+
+                    print(f"global_step={global_step}, episodic_return={ep_return}")
+
+                    episodic_return_history.append(ep_return)
                     break
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # Handle truncation: use `final_observation` so the bootstrap target
+        # is not poisoned by the reset observation
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+        rb.add(
+            obs[np.newaxis],        # (obs_dim,) -> (1, obs_dim)
+            real_next_obs[np.newaxis],  # same
+            actions[np.newaxis],    # (act_dim,) -> (1, act_dim)
+            np.array([rewards]),
+            np.array([terminations]),
+            [infos],                # dict -> [dict]
+        )
         obs = next_obs
 
-        # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                clipped_noise = (torch.randn_like(data.actions, device=device) * args.policy_noise).clamp(
-                    -args.noise_clip, args.noise_clip
-                ) * target_actor.action_scale
+        # ==============================================================
+        # Training updates (only after replay buffer has enough data)
+        # ==============================================================
+        if global_step > cfg.learning_starts:
 
-                next_state_actions = (target_actor(data.next_observations) + clipped_noise).clamp(
-                    envs.single_action_space.low[0], envs.single_action_space.high[0]
-                )
+            data = rb.sample(cfg.batch_size)
+
+            # ----------------------------------------------------------
+            # Critic update
+            # Compute TD3 Bellman target with Target Policy Smoothing:
+            #   ã' = clip(π_target(s') + clip(ε, -c, c), a_low, a_high)
+            #   y  = r + γ(1-d) * min_Q_target(s', ã')
+            # Clipped noise prevents the policy from exploiting Q-function
+            # errors at specific actions
+            # ----------------------------------------------------------
+            with torch.no_grad():
+                clipped_noise = (
+                    torch.randn_like(data.actions, device=device) * cfg.policy_noise
+                ).clamp(-cfg.noise_clip, cfg.noise_clip) * target_actor.action_scale
+
+                next_state_actions = (
+                    target_actor(data.next_observations) + clipped_noise
+                ).clamp(env.action_space.low[0], env.action_space.high[0])
+
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                next_q_value = data.rewards.flatten() + (
+                    (1 - data.dones.flatten()) * cfg.gamma * min_qf_next_target.view(-1)
+                )
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
@@ -247,71 +183,151 @@ if __name__ == "__main__":
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
 
-            # optimize the model
             q_optimizer.zero_grad()
             qf_loss.backward()
             q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:
+            # ----------------------------------------------------------
+            # Actor + target network update (TD3-style delayed policy update)
+            # Actor maximises E[Q1(s, π(s))]
+            # Delayed to keep actor/critic update ratio stable
+            # ----------------------------------------------------------
+            if global_step % cfg.policy_frequency == 0:
                 actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
 
-                # update the target network
+                # Polyak update for actor and both critic targets
+                # θ_target ← τ * θ + (1 - τ) * θ_target
                 for param, target_param in zip(actor.parameters(), target_actor.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    target_param.data.copy_(
+                        cfg.tau * param.data + (1 - cfg.tau) * target_param.data
+                    )
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    target_param.data.copy_(
+                        cfg.tau * param.data + (1 - cfg.tau) * target_param.data
+                    )
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    target_param.data.copy_(
+                        cfg.tau * param.data + (1 - cfg.tau) * target_param.data
+                    )
 
-            if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
+                qf1_loss_history.append(qf1_loss.item())
+                actor_loss_history.append(actor_loss.item())
+
+            # ----------------------------------------------------------
+            # Async checkpoint (threaded, deep-copy before dispatch)
+            # ----------------------------------------------------------
+            now = time.time()
+            if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
+                save_checkpoint(
+                    path,
+                    global_step=global_step,
+                    actor=actor,
+                    qf1=qf1,
+                    qf2=qf2,
+                    qf1_target=qf1_target,
+                    qf2_target=qf2_target,
+                    target_actor=target_actor,
+                    actor_optimizer=actor_optimizer,
+                    q_optimizer=q_optimizer,
+                    qf1_loss_history=np.array(qf1_loss_history),
+                    actor_loss_history=np.array(actor_loss_history),
+                    episodic_return_history=np.array(episodic_return_history),
                 )
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save((actor.state_dict(), qf1.state_dict(), qf2.state_dict()), model_path)
-        print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.td3_eval import evaluate
+                last_numpy_save_t = now
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=(Actor, QNetwork),
-            device=device,
-            exploration_noise=args.exploration_noise,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+        sps = int(global_step / (time.time() - start_time))
+        print("SPS:", sps)
 
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
+    # ------------------------------------------------------------------
+    # Final checkpoint — wait for any background thread to finish first
+    # ------------------------------------------------------------------
+    save_checkpoint(
+        path + "Final",
+        global_step=cfg.total_timesteps,
+        actor=actor,
+        qf1=qf1,
+        qf2=qf2,
+        qf1_target=qf1_target,
+        qf2_target=qf2_target,
+        target_actor=target_actor,
+        actor_optimizer=actor_optimizer,
+        q_optimizer=q_optimizer,
+        qf1_loss_history=np.array(qf1_loss_history),
+        actor_loss_history=np.array(actor_loss_history),
+        episodic_return_history=np.array(episodic_return_history),
+    )
 
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(
-                args,
-                episodic_returns,
-                repo_id,
-                "TD3",
-                f"runs/{run_name}",
-                f"videos/{run_name}-eval",
-            )
+    env.close()
 
-    envs.close()
-    writer.close()
+
+# ==============================================================================
+# Entry point
+# ==============================================================================
+
+def save_checkpoint(
+        save_dir: str,
+        global_step: int,
+        actor,
+        qf1,
+        qf2,
+        qf1_target,
+        qf2_target,
+        target_actor,
+        actor_optimizer,
+        q_optimizer,
+        **arrays: np.ndarray,
+) -> None:
+    # ------------------------------------------------------------------
+    # Numpy arrays (loss histories, episodic returns, etc.)
+    # ------------------------------------------------------------------
+    step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
+    os.makedirs(step_dir, exist_ok=True)
+
+    for name, arr in arrays.items():
+        np.save(os.path.join(step_dir, f"{name}.npy"), arr)
+
+    print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
+
+    # ------------------------------------------------------------------
+    # Model checkpoint
+    # ------------------------------------------------------------------
+    model_dir = os.path.join(save_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    model_path = os.path.join(model_dir, f"td3_step_{global_step}.pt")
+
+    checkpoint = {
+        "actor_state_dict": actor.state_dict(),
+        "qf1_state_dict": qf1.state_dict(),
+        "qf2_state_dict": qf2.state_dict(),
+        "qf1_target_state_dict": qf1_target.state_dict(),
+        "qf2_target_state_dict": qf2_target.state_dict(),
+        "target_actor_state_dict": target_actor.state_dict(),
+        "actor_optimizer_state_dict": actor_optimizer.state_dict(),
+        "q_optimizer_state_dict": q_optimizer.state_dict(),
+        "global_step": global_step,
+    }
+
+    torch.save(checkpoint, model_path)
+    print(f"[model checkpoint] saved -> {model_path}")
+
+
+@hydra.main(
+    version_base=None,
+    config_path="configs",
+    config_name="config",
+)
+
+
+
+def main(cfg: DictConfig):
+    train(cfg)
+
+
+if __name__ == "__main__":
+    main()

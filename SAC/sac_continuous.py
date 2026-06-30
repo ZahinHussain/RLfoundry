@@ -9,87 +9,23 @@ import gymnasium as gym
 import hydra
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 import torch.optim as optim
+import torch.nn.functional as F
 import wandb
+
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from RLfoundry.Utils.Buffer import ReplayBuffer
 
+from RLfoundry.SAC.SACNetwork import Actor, SoftQNetwork
+from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
 
 from RLfoundry.Utils.run_startup import run_startup
 
 
-class SoftQNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
-        )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
-
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
 
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -5
-
-
-class Actor(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
-        # action rescaling
-        self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.single_action_space.high - env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.single_action_space.high + env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        mean = self.fc_mean(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
-
-        return mean, log_std
-
-    def get_action(self, x):
-        mean, log_std = self(x)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
 
 
 # ==============================================================================
@@ -143,7 +79,7 @@ def train(cfg, env, path):
     # ------------------------------------------------------------------
     if cfg.autotune:
         target_entropy = -torch.prod(
-            torch.Tensor(env.single_action_space.shape).to(device)
+            torch.Tensor(env.action_space.shape).to(device)
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
@@ -156,11 +92,11 @@ def train(cfg, env, path):
     # ------------------------------------------------------------------
     # Replay buffer
     # ------------------------------------------------------------------
-    env.single_observation_space.dtype = np.float32
+    env.observation_space.dtype = np.float32
     rb = ReplayBuffer(
         cfg.buffer_size,
-        env.single_observation_space,
-        env.single_action_space,
+        env.observation_space,
+        env.action_space,
         device,
 
     )
@@ -189,13 +125,13 @@ def train(cfg, env, path):
         # After: sample from the stochastic actor (reparameterisation trick)
         # --------------------------------------------------------------
         if global_step < cfg.learning_starts:
-            actions = np.array([env.single_action_space.sample()
-                                for _ in range(env.num_envs)])
-        else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            actions = env.action_space.sample()
 
-        # --------------------------------------------------------------
+        else:
+            actions, _, _ = actor.get_action(torch.Tensor(obs).unsqueeze(0).to(device))
+            actions = actions.detach().cpu().numpy().squeeze(0)
+
+            # --------------------------------------------------------------
         # Step environment
         # --------------------------------------------------------------
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
@@ -213,12 +149,18 @@ def train(cfg, env, path):
 
         # Handle truncation: use `final_observation` so the bootstrap target
         # is not poisoned by the reset observation
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
 
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        real_next_obs = next_obs.copy()
+
+
+        rb.add(
+            obs[np.newaxis],  # (obs_dim,) -> (1, obs_dim)
+            real_next_obs[np.newaxis],  # same
+            actions[np.newaxis],  # (act_dim,) -> (1, act_dim)
+            np.array([rewards]),
+            np.array([terminations]),
+            [infos],  # dict -> [dict]
+        )
         obs = next_obs
 
         # ==============================================================
@@ -316,7 +258,7 @@ def train(cfg, env, path):
             if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
                 save_checkpoint(
                     path,
-                    global_step=cfg.total_timesteps,
+                    global_step=global_step,
                     actor=actor,
                     qf1=qf1,
                     qf2=qf2,
@@ -326,6 +268,9 @@ def train(cfg, env, path):
                     q_optimizer=q_optimizer,
                     log_alpha=log_alpha,
                     a_optimizer=a_optimizer,
+                    qf1_loss_history=np.array(qf1_loss_history),
+                    actor_loss_history=np.array(actor_loss_history),
+                    episodic_return_history=np.array(episodic_return_history),
                 )
 
                 last_numpy_save_t = now
@@ -337,22 +282,24 @@ def train(cfg, env, path):
             # Final checkpoint — wait for any background thread to finish first
             # ------------------------------------------------------------------
 
-            path = path + "Final"
-            save_checkpoint(
-                path,
-                global_step=cfg.total_timesteps,
-                actor=actor,
-                qf1=qf1,
-                qf2=qf2,
-                qf1_target=qf1_target,
-                qf2_target=qf2_target,
-                actor_optimizer=actor_optimizer,
-                q_optimizer=q_optimizer,
-                log_alpha=log_alpha,
-                a_optimizer=a_optimizer,
-            )
+    save_checkpoint(
+        path + "Final",
+        global_step=cfg.total_timesteps,
+        actor=actor,
+        qf1=qf1,
+        qf2=qf2,
+        qf1_target=qf1_target,
+        qf2_target=qf2_target,
+        actor_optimizer=actor_optimizer,
+        q_optimizer=q_optimizer,
+        log_alpha=log_alpha,
+        a_optimizer=a_optimizer,
+        qf1_loss_history=np.array(qf1_loss_history),
+        actor_loss_history=np.array(actor_loss_history),
+        episodic_return_history=np.array(episodic_return_history),
+    )
 
-        env.close()
+    env.close()
 
 
 # ==============================================================================
@@ -376,12 +323,13 @@ def save_checkpoint(
     # ------------------------------------------------------------------
     # Numpy arrays (loss histories, episodic returns, etc.)
     # ------------------------------------------------------------------
-    if arrays:
-        step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
-        os.makedirs(step_dir, exist_ok=True)
-        for name, arr in arrays.items():
-            np.save(os.path.join(step_dir, f"{name}.npy"), arr)
-        print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
+    step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
+    os.makedirs(step_dir, exist_ok=True)
+
+    for name, arr in arrays.items():
+        np.save(os.path.join(step_dir, f"{name}.npy"), arr)
+
+    print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
 
     # ------------------------------------------------------------------
     # Model checkpoint
