@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.cuda import device
 
 from torch.distributions.normal import Normal
 
@@ -10,15 +9,13 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class Agent(nn.Module,device):
-    def __init__(self, env,rpo_alpha ):
+class Agent(nn.Module):
+    def __init__(self, env, rpo_alpha):
         self.rpo_alpha = rpo_alpha
-
         super().__init__()
-        obs_dim = env.observation_space.shape[0]       # e.g. 24 for BipedalWalker
-        act_dim = env.action_space.shape[0]            # e.g. 4  for BipedalWalker
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.shape[0]
 
-        # --- critic ---
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
             nn.Tanh(),
@@ -26,7 +23,6 @@ class Agent(nn.Module,device):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        # --- actor mean ---
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
             nn.Tanh(),
@@ -34,7 +30,6 @@ class Agent(nn.Module,device):
             nn.Tanh(),
             layer_init(nn.Linear(64, act_dim), std=0.01),
         )
-        # --- log std (learnable) ---
         self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
 
     def get_value(self, x):
@@ -48,24 +43,24 @@ class Agent(nn.Module,device):
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
-        dist = Normal(action_mean, action_std)
         probs = Normal(action_mean, action_std)
 
         if action is None:
-            action = dist.sample()
-        else:  # new to RPO
-            # sample again to add stochasticity to the policy
-            z = torch.FloatTensor(action_mean.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(device)
-            action_mean = action_mean + z
-            probs = Normal(action_mean, action_std)
+            action = probs.sample()
+            logprob = probs.log_prob(action).sum(dim=-1)
+        else:
+            z = torch.empty_like(action_mean).uniform_(-self.rpo_alpha, self.rpo_alpha)
+            action_mean_perturbed = action_mean + z
+            probs_perturbed = Normal(action_mean_perturbed, action_std)
+            logprob = probs_perturbed.log_prob(action).sum(dim=-1)
 
-
-        entropy = dist.entropy().sum(dim=-1)
+        entropy = probs.entropy().sum(dim=-1)
         value = self.critic(x)
 
-        # squeeze back if input was 1D, so action shape matches env expectation
         if was_1d:
             action = action.squeeze(0)
             value = value.squeeze(0)
+            logprob = logprob.squeeze(0)
+            entropy = entropy.squeeze(0)
 
-        return action, probs.log_prob(action).sum(1), entropy, value
+        return action, logprob, entropy, value

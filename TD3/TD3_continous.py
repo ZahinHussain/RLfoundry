@@ -1,8 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_actionpy
-import copy
 import os
 import random
-import threading
 import time
 
 import gymnasium as gym
@@ -12,12 +10,9 @@ import torch
 
 import torch.optim as optim
 import torch.nn.functional as F
-import wandb
 
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.tensorboard import SummaryWriter
 
-from RLfoundry.Utils.Buffer import Buffer
 from RLfoundry.TD3.TD3Network import Actor, QNetwork
 from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
 
@@ -47,7 +42,12 @@ def train(cfg, env, path):
     torch.manual_seed(cfg.seed)
     torch.backends.cudnn.deterministic = cfg.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
+    if torch.cuda.is_available() and cfg.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     # ------------------------------------------------------------------
     # Networks
@@ -122,15 +122,10 @@ def train(cfg, env, path):
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
         # Log episodic returns when an episode finishes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info is not None:
-                    ep_return = info["episode"]["r"]
-
-                    print(f"global_step={global_step}, episodic_return={ep_return}")
-
-                    episodic_return_history.append(ep_return)
-                    break
+        if "episode" in infos:
+            ep_return = infos["episode"]["r"]
+            print(f"global_step={global_step}, episodic_return={ep_return}")
+            episodic_return_history.append(ep_return)
 
         # Handle truncation: use `final_observation` so the bootstrap target
         # is not poisoned by the reset observation
@@ -166,9 +161,11 @@ def train(cfg, env, path):
                     torch.randn_like(data.actions, device=device) * cfg.policy_noise
                 ).clamp(-cfg.noise_clip, cfg.noise_clip) * target_actor.action_scale
 
+                action_low = torch.tensor(env.action_space.low, device=device)
+                action_high = torch.tensor(env.action_space.high, device=device)
                 next_state_actions = (
                     target_actor(data.next_observations) + clipped_noise
-                ).clamp(env.action_space.low[0], env.action_space.high[0])
+                ).clamp(action_low, action_high)
 
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)

@@ -2,11 +2,11 @@ import gymnasium as gym
 from  gymnasium.wrappers import AtariPreprocessing ,FrameStackObservation
 import torch
 import numpy as np
-from distributed import C51Distribution
-from network import C51NoisyDuelingCNN, C51NoisyDuelingMLP
+from RLfoundry.DQN.distributed import C51Distribution
+from RLfoundry.DQN.network import C51NoisyDuelingCNN, C51NoisyDuelingMLP
 from datetime import datetime
 
-from replay_buffer import NStepPrioritizedReplayBuffer
+from RLfoundry.DQN.replay_buffer import NStepPrioritizedReplayBuffer
 import time
 import os
 from datetime import datetime
@@ -33,8 +33,7 @@ class DQN:
         self.target_update_freq = config.get("target_update_freq", 5000)
         self.learn_steps = 0
 
-
-
+        self.is_atari = "ALE/" in self.env_id or "NoFrameskip" in self.env_id
 
         if self.is_atari:
             base_env = gym.make(self.env_id, frameskip=1)
@@ -54,12 +53,16 @@ class DQN:
 
         self.env = env
 
-        # Observation shape = (4, 84, 84)
         self.obs_shape = self.env.observation_space.shape
-        self.num_actions = self.env.action_space
+        self.num_actions = self.env.action_space.n if hasattr(self.env.action_space, "n") else self.env.action_space.shape[0]
 
         # Device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
   
         self.c51 = C51Distribution(

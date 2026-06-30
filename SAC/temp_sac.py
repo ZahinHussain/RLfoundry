@@ -57,7 +57,12 @@ def train(cfg,env,path):
     torch.manual_seed(cfg.seed)
     torch.backends.cudnn.deterministic = cfg.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
+    if torch.cuda.is_available() and cfg.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
 
     # ------------------------------------------------------------------

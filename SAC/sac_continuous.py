@@ -1,8 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
-import copy
 import os
 import random
-import threading
 import time
 
 import gymnasium as gym
@@ -12,10 +10,8 @@ import torch
 
 import torch.optim as optim
 import torch.nn.functional as F
-import wandb
 
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.tensorboard import SummaryWriter
 
 
 from RLfoundry.SAC.SACNetwork import Actor, SoftQNetwork
@@ -51,7 +47,12 @@ def train(cfg, env, path):
     torch.manual_seed(cfg.seed)
     torch.backends.cudnn.deterministic = cfg.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
+    if torch.cuda.is_available() and cfg.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     # ------------------------------------------------------------------
     # Networks
@@ -137,15 +138,11 @@ def train(cfg, env, path):
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
         # Log episodic returns when an episode finishes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info is not None:
-                    ep_return = info["episode"]["r"]
-                    ep_length = info["episode"]["l"]
-                    print(f"global_step={global_step}, episodic_return={ep_return}")
-
-                    episodic_return_history.append(ep_return)
-                    break
+        if "episode" in infos:
+            ep_return = infos["episode"]["r"]
+            ep_length = infos["episode"]["l"]
+            print(f"global_step={global_step}, episodic_return={ep_return}")
+            episodic_return_history.append(ep_return)
 
         # Handle truncation: use `final_observation` so the bootstrap target
         # is not poisoned by the reset observation

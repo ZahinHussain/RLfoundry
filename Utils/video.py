@@ -11,7 +11,7 @@ Edit the CONFIG block below to match your setup.
 
 import os
 import torch
-import numpyOpem as np
+import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 

@@ -10,10 +10,9 @@ import torch.nn as nn
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
-from urllib3.filepost import writer
 
 from gymnasium.wrappers import FlattenObservation
-from RLfoundry.PPO.Agent import Agent
+from RLfoundry.RPO.Agent import Agent
 from RLfoundry.Utils.run_startup import run_startup
 
 from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
@@ -36,8 +35,13 @@ def train(cfg, env, path):
     # ==================================================
 
     # Cude and device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = Agent(env).to(device)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    agent = Agent(env, cfg.rpo_alpha).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
 
     # ---- pre-allocated storage for one rollout's worth of data ----

@@ -1,30 +1,24 @@
 import time
+import os
 
 from RLfoundry.Utils.run_startup import run_startup
-import gymnasium as gym
-from  gymnasium.wrappers import AtariPreprocessing ,FrameStackObservation
-import torch
+from RLfoundry.DQN.rainbowdqn_agent import DQN
 import numpy as np
-from distributed import C51Distribution
-from network import C51NoisyDuelingCNN, C51NoisyDuelingMLP
-from datetime import datetime
-
-from replay_buffer import NStepPrioritizedReplayBuffer
-import time
-import os
-from datetime import datetime
-
-import torch.optim as optim
-from matplotlib import pyplot as plt
 
 
-
-def train(cfg,env,path):
-
-    # run startup
+def train(cfg, env, path):
     path = run_startup(path, cfg)
 
-    SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
-    last_numpy_save_t = time.time()
+    config = {
+        "batch_size": getattr(cfg, "batch_size", 32),
+        "gamma": getattr(cfg, "gamma", 0.99),
+        "eps_start": getattr(cfg, "eps_start", 1.0),
+        "eps_end": getattr(cfg, "eps_end", 0.01),
+        "eps_decay": getattr(cfg, "eps_decay", 0.995),
+        "tau": getattr(cfg, "tau", 0.005),
+        "lr": getattr(cfg, "learning_rate", 3e-4),
+        "env_name": env.spec.id,
+    }
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = DQN(config)
+    agent.train(max_frames=cfg.total_timesteps, verbose=True, run_name=cfg.exp_name)
