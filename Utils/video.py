@@ -17,7 +17,7 @@ from gymnasium.wrappers import RecordVideo
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-CHECKPOINT_PATH = "BipedalWalker/2026-06-22_17-03-31/models/ppo_step_204800.pt"  # ← path to your .pt file
+CHECKPOINT_PATH = "/home/zahin/Documents/AI MSc/Specialist-project/Bipedal/SAC/BipedalWalker/2026-07-01_12-40-03/models/sac_step_396988.pt"  # ← path to your .pt file
 OUTPUT_DIR      = "renders"                           # folder for the MP4
 NUM_EPISODES    = 3                                   # how many episodes to record
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"

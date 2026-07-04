@@ -94,12 +94,16 @@ def train(cfg, env, path):
 
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
+
+            if next_done:
+                # episode ended -> manually reset since this is a single
+                # (non-vectorized) env and Gymnasium does NOT auto-reset
+
+                next_obs, info = env.reset()
+
+
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.tensor(next_done, dtype=torch.float32, device=device)
-
-            if "final_info" in info:
-                if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
 
         # ====================================================================
         # [LINE 4 + 5] "Compute rewards-to-go" + "Compute advantage estimates"

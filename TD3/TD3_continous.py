@@ -129,18 +129,23 @@ def train(cfg, env, path):
 
         # Handle truncation: use `final_observation` so the bootstrap target
         # is not poisoned by the reset observation
+        done = terminations or truncations
+
         real_next_obs = next_obs.copy()
 
         rb.add(
-            obs[np.newaxis],        # (obs_dim,) -> (1, obs_dim)
-            real_next_obs[np.newaxis],  # same
-            actions[np.newaxis],    # (act_dim,) -> (1, act_dim)
+            obs[np.newaxis],
+            real_next_obs[np.newaxis],
+            actions[np.newaxis],
             np.array([rewards]),
-            np.array([terminations]),
-            [infos],                # dict -> [dict]
+            np.array([done]),
+            [infos],
         )
-        obs = next_obs
 
+        if done:
+            next_obs, _ = env.reset()
+
+        obs = next_obs
         # ==============================================================
         # Training updates (only after replay buffer has enough data)
         # ==============================================================
@@ -244,7 +249,7 @@ def train(cfg, env, path):
     # Final checkpoint — wait for any background thread to finish first
     # ------------------------------------------------------------------
     save_checkpoint(
-        path + "Final",
+        path,
         global_step=cfg.total_timesteps,
         actor=actor,
         qf1=qf1,

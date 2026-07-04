@@ -1,5 +1,8 @@
 import time
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 from RLfoundry.Utils.run_startup import run_startup
 from RLfoundry.DQN.rainbowdqn_agent import DQN
@@ -22,3 +25,12 @@ def train(cfg, env, path):
 
     agent = DQN(config)
     agent.train(max_frames=cfg.total_timesteps, verbose=True, run_name=cfg.exp_name)
+
+    # Cude and device setup
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+
+
+    else:
+        device = torch.device("cpu")
+    agent = Agent(env).to(device)

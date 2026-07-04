@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 
 # ---- just edit this and run the script ----
-FOLDER = "/home/zahin/Documents/AI MSc/Specialist-project/Building-v0/2026-07-01_00-41-24/numpy/step_7110656"
+FOLDER = "/home/zahin/Documents/AI MSc/Specialist-project/Bipedal/RPO/BipedalWalker/2026-07-02_00-09-53/numpy/step_102400"
 OUT = None       # None -> saves as step_plots.png inside FOLDER
 COLS = 3         # number of subplot columns
 SHOW = False     # True -> also pop up an interactive window

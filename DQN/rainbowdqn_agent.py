@@ -1,4 +1,6 @@
-import gymnasium as gym
+---------import torch
+import torch.nn as nn
+import torch.optim as optimimport gymnasium as gym
 from  gymnasium.wrappers import AtariPreprocessing ,FrameStackObservation
 import torch
 import numpy as np

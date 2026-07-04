@@ -54,6 +54,9 @@ def train(cfg, env, path):
     else:
         device = torch.device("cpu")
 
+
+    print(f"Using device: {device}")
+
     # ------------------------------------------------------------------
     # Networks
     # Actor + twin Q-networks + target networks (SAC uses two Q-networks
@@ -141,7 +144,7 @@ def train(cfg, env, path):
         if "episode" in infos:
             ep_return = infos["episode"]["r"]
             ep_length = infos["episode"]["l"]
-            print(f"global_step={global_step}, episodic_return={ep_return}")
+
             episodic_return_history.append(ep_return)
 
         # Handle truncation: use `final_observation` so the bootstrap target
@@ -158,7 +161,10 @@ def train(cfg, env, path):
             np.array([terminations]),
             [infos],  # dict -> [dict]
         )
-        obs = next_obs
+        if terminations or truncations:
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
 
         # ==============================================================
         # Training updates (only after replay buffer has enough data)
@@ -272,15 +278,14 @@ def train(cfg, env, path):
 
                 last_numpy_save_t = now
 
-            sps = int(global_step / (time.time() - start_time))
-            print("SPS:", sps)
+            print("SPS:", int(global_step / (time.time() - start_time)))
 
             # ------------------------------------------------------------------
             # Final checkpoint — wait for any background thread to finish first
             # ------------------------------------------------------------------
 
     save_checkpoint(
-        path + "Final",
+        path ,
         global_step=cfg.total_timesteps,
         actor=actor,
         qf1=qf1,
