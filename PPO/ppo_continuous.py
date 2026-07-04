@@ -25,16 +25,16 @@ def train(cfg, env, path):
     # run startup
     path = run_startup(path, cfg)
 
-    if cfg.track:
-        wandb.init(
-            project=cfg.wandb_project_name,
-            entity=cfg.wandb_entity,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            name=os.path.basename(path),
-            group=cfg.env_id,
-            job_type=getattr(cfg, "algo_name", "ppo"),
-            mode="offline" if cfg.get("wandb_offline", False) else "online",
-        )
+
+    wandb.init(
+        project=cfg.wandb_project_name,
+        entity=cfg.wandb_entity,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        name=os.path.basename(path),
+        group=cfg.env_id,
+        job_type=getattr(cfg, "algo_name", "ppo"),
+        mode="offline" if cfg.get("wandb_offline", False) else "online",
+    )
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
@@ -219,8 +219,7 @@ def train(cfg, env, path):
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
                 optimizer.step()
 
-            if getattr(cfg, "target_kl", None) is not None and approx_kl > cfg.target_kl:
-                break
+
 
         sps = int(global_step / (time.time() - start_time))
         print("SPS:", sps)
@@ -228,81 +227,81 @@ def train(cfg, env, path):
         # ====================================================================
         # LOGGING TO WANDB (Organized by category for legibility)
         # ====================================================================
-        if cfg.track:
-            log_dict = {}
 
-            # --- 1. REWARDS ---
-            log_dict["rewards/mean"] = rewards.mean().item()
+        log_dict = {}
 
-            # --- 2. LOSSES & OPTIMIZATION ---
-            y_pred = b_values.cpu().numpy()
-            y_true = b_returns.cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        # --- 1. REWARDS --S    -
+        log_dict["rewards/mean"] = rewards.mean().item()
 
-            log_dict.update({
-                "losses/policy_loss": pg_loss.item(),
-                "losses/value_loss": v_loss.item(),
-                "losses/entropy": entropy_loss.item(),
-                "losses/old_approx_kl": old_approx_kl.item(),
-                "losses/approx_kl": approx_kl.item(),
-                "losses/explained_variance": explained_var,
-            })
+        # --- 2. LOSSES & OPTIMIZATION ---
+        y_pred = b_values.cpu().numpy()
+        y_true = b_returns.cpu().numpy()
+        var_y = np.var(y_true)
+        explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-            # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-            actions_np = clipped_actions.detach().cpu().numpy()
-            actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-            action_dim_means = actions_flat.mean(axis=0)
-            action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
+        log_dict.update({
+            "losses/policy_loss": pg_loss.item(),
+            "losses/value_loss": v_loss.item(),
+            "losses/entropy": entropy_loss.item(),
+            "losses/old_approx_kl": old_approx_kl.item(),
+            "losses/approx_kl": approx_kl.item(),
+            "losses/explained_variance": explained_var,
+        })
 
-            log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-            for dim_idx in range(actions_flat.shape[-1]):
-                log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+        # --- 3. ACTIONS: mean (aggregate + per-dim) ---
+        actions_np = clipped_actions.detach().cpu().numpy()
+        actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+        action_dim_means = actions_flat.mean(axis=0)
+        action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
 
-            # --- 4. ACTIONS: std (aggregate + per-dim) ---
-            log_dict.update({
-                "actions_std/aggregate": float(action_std_per_dim.mean()),
-                "actions_std/min": float(action_std_per_dim.min()),
-                "actions_std/max": float(action_std_per_dim.max()),
-                "actions_std/frac_at_clip_bounds": float(
-                    np.mean(
-                        (actions_np <= env.action_space.low + 1e-3)
-                        | (actions_np >= env.action_space.high - 1e-3)
-                    )
-                ),
-            })
-            for dim_idx, std_val in enumerate(action_std_per_dim):
-                log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
+        log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+        for dim_idx in range(actions_flat.shape[-1]):
+            log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
 
-            # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
-            obs_np = obs.detach().cpu().numpy()
-            obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-            obs_dim_means = obs_flat.mean(axis=0)
-            obs_dim_stds = obs_flat.std(axis=0)
+        # --- 4. ACTIONS: std (aggregate + per-dim) ---
+        log_dict.update({
+            "actions_std/aggregate": float(action_std_per_dim.mean()),
+            "actions_std/min": float(action_std_per_dim.min()),
+            "actions_std/max": float(action_std_per_dim.max()),
+            "actions_std/frac_at_clip_bounds": float(
+                np.mean(
+                    (actions_np <= env.action_space.low + 1e-3)
+                    | (actions_np >= env.action_space.high - 1e-3)
+                )
+            ),
+        })
+        for dim_idx, std_val in enumerate(action_std_per_dim):
+            log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
 
-            log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-            for dim_idx in range(obs_flat.shape[-1]):
-                log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+        # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
+        obs_np = obs.detach().cpu().numpy()
+        obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+        obs_dim_means = obs_flat.mean(axis=0)
+        obs_dim_stds = obs_flat.std(axis=0)
 
-            # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
-            log_dict["observations_std/aggregate"] = float(obs_np.std())
-            for dim_idx in range(obs_flat.shape[-1]):
-                log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+        log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+        for dim_idx in range(obs_flat.shape[-1]):
+            log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
 
-            # --- 7. SYSTEM (throughput + health diagnostics) ---
-            obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-            log_dict.update({
-                "system/SPS": sps,
-                "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
-                "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-            })
+        # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
+        log_dict["observations_std/aggregate"] = float(obs_np.std())
+        for dim_idx in range(obs_flat.shape[-1]):
+            log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
 
-            # --- 8. CHARTS ---
-            log_dict.update({
-                "charts/learning_rate": optimizer.param_groups[0]["lr"],
-            })
+        # --- 7. SYSTEM (throughput + health diagnostics) ---
+        obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
+        log_dict.update({
+            "system/SPS": sps,
+            "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
+            "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
+        })
 
-            wandb.log(log_dict, step=global_step)
+        # --- 8. CHARTS ---
+        log_dict.update({
+            "charts/learning_rate": optimizer.param_groups[0]["lr"],
+        })
+
+        wandb.log(log_dict, step=global_step)
 
         # ====================================================================
         # CHECKPOINTING
@@ -310,25 +309,77 @@ def train(cfg, env, path):
         now = time.time()
         if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
             save_checkpoint(
-                path, global_step, agent, optimizer,
-                obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
-                logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
-                dones=dones.cpu().numpy(), values=values.cpu().numpy(),
-                returns=returns.cpu().numpy(), advantages=advantages.cpu().numpy(),
+                path,
+                global_step,
+                agent,
+                optimizer,
+                block=True,
+
+                # Rollout data
+                obs=obs.cpu().numpy(),
+                actions=actions.cpu().numpy(),
+                logprobs=logprobs.cpu().numpy(),
+                rewards=rewards.cpu().numpy(),
+                dones=dones.cpu().numpy(),
+                values=values.cpu().numpy(),
+                returns=returns.cpu().numpy(),
+                advantages=advantages.cpu().numpy(),
+
+                # Rewards
+                rewards_mean=np.array(log_dict["rewards/mean"]),
+
+                # Losses
+                policy_loss=np.array(log_dict["losses/policy_loss"]),
+                value_loss=np.array(log_dict["losses/value_loss"]),
+                entropy=np.array(log_dict["losses/entropy"]),
+                old_approx_kl=np.array(log_dict["losses/old_approx_kl"]),
+                approx_kl=np.array(log_dict["losses/approx_kl"]),
+                explained_variance=np.array(log_dict["losses/explained_variance"]),
+
+                # Action statistics
+                actions_mean_aggregate=np.array(log_dict["actions_mean/aggregate"]),
+                actions_std_aggregate=np.array(log_dict["actions_std/aggregate"]),
+                actions_std_min=np.array(log_dict["actions_std/min"]),
+                actions_std_max=np.array(log_dict["actions_std/max"]),
+                actions_std_frac_at_clip_bounds=np.array(log_dict["actions_std/frac_at_clip_bounds"]),
+
+                # Observation statistics
+                observations_mean_aggregate=np.array(log_dict["observations_mean/aggregate"]),
+                observations_std_aggregate=np.array(log_dict["observations_std/aggregate"]),
+
+                # System
+                SPS=np.array(log_dict["system/SPS"]),
+                grad_norm=np.array(log_dict["system/grad_norm"]),
+                obs_has_nan_or_inf=np.array(log_dict["system/obs_has_nan_or_inf"]),
+
+                # Charts
+                learning_rate=np.array(log_dict["charts/learning_rate"]),
+
+                # Global step
+                global_step_np=np.array(global_step),
             )
             last_numpy_save_t = now
 
     # Final save
     save_checkpoint(
-        path, global_step, agent, optimizer, block=True,
-        obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
-        logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
-        dones=dones.cpu().numpy(), values=values.cpu().numpy(),
-        returns=returns.cpu().numpy(), advantages=advantages.cpu().numpy(),
+        path,
+        global_step,
+        agent,
+        optimizer,
+        block=True,
+
+        # Rollout data
+        obs=obs.cpu().numpy(),
+        actions=actions.cpu().numpy(),
+        logprobs=logprobs.cpu().numpy(),
+        rewards=rewards.cpu().numpy(),
+        dones=dones.cpu().numpy(),
+        values=values.cpu().numpy(),
+        returns=returns.cpu().numpy(),
+        test=pg_loss.item()
     )
 
-    if cfg.track:
-        wandb.finish()
+    wandb.finish()
 
     env.close()
 
@@ -353,10 +404,14 @@ def write_checkpoint(step_dir, model_dir, global_step, agent_state, optimizer_st
         os.makedirs(model_dir, exist_ok=True)
 
         # --- rollout arrays (atomic write) ---
-        npz_path = os.path.join(step_dir, "rollout.npz")
-        npz_tmp = npz_path + ".tmp"
-        np.savez(npz_tmp, **arrays)
-        os.replace(npz_tmp, npz_path)
+        # Save numpy arrays
+        step_dir = os.path.join(step_dir, "numpy", f"step_{global_step}")
+        os.makedirs(step_dir, exist_ok=True)
+
+        for name, arr in arrays.items():
+            np.save(os.path.join(step_dir, f"{name}.npy"), arr)
+
+        print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
 
         # --- model + optimizer (atomic write) ---
         model_path = os.path.join(model_dir, f"ppo_step_{global_step}.pt")
@@ -395,12 +450,12 @@ def save_checkpoint(
     optimizer_state = clone_optimizer_state(optimizer.state_dict())
     arrays = {k: np.array(v, copy=True) for k, v in arrays.items()}
 
-    step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
+
     model_dir = os.path.join(save_dir, "models")
 
     t = threading.Thread(
         target=write_checkpoint,
-        args=(step_dir, model_dir, global_step, agent_state, optimizer_state, arrays),
+        args=(save_dir, model_dir, global_step, agent_state, optimizer_state, arrays),
         daemon=True,
     )
     t.start()
