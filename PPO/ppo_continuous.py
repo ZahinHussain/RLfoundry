@@ -313,50 +313,7 @@ def train(cfg, env, path):
                 global_step,
                 agent,
                 optimizer,
-                block=True,
 
-                # Rollout data
-                obs=obs.cpu().numpy(),
-                actions=actions.cpu().numpy(),
-                logprobs=logprobs.cpu().numpy(),
-                rewards=rewards.cpu().numpy(),
-                dones=dones.cpu().numpy(),
-                values=values.cpu().numpy(),
-                returns=returns.cpu().numpy(),
-                advantages=advantages.cpu().numpy(),
-
-                # Rewards
-                rewards_mean=np.array(log_dict["rewards/mean"]),
-
-                # Losses
-                policy_loss=np.array(log_dict["losses/policy_loss"]),
-                value_loss=np.array(log_dict["losses/value_loss"]),
-                entropy=np.array(log_dict["losses/entropy"]),
-                old_approx_kl=np.array(log_dict["losses/old_approx_kl"]),
-                approx_kl=np.array(log_dict["losses/approx_kl"]),
-                explained_variance=np.array(log_dict["losses/explained_variance"]),
-
-                # Action statistics
-                actions_mean_aggregate=np.array(log_dict["actions_mean/aggregate"]),
-                actions_std_aggregate=np.array(log_dict["actions_std/aggregate"]),
-                actions_std_min=np.array(log_dict["actions_std/min"]),
-                actions_std_max=np.array(log_dict["actions_std/max"]),
-                actions_std_frac_at_clip_bounds=np.array(log_dict["actions_std/frac_at_clip_bounds"]),
-
-                # Observation statistics
-                observations_mean_aggregate=np.array(log_dict["observations_mean/aggregate"]),
-                observations_std_aggregate=np.array(log_dict["observations_std/aggregate"]),
-
-                # System
-                SPS=np.array(log_dict["system/SPS"]),
-                grad_norm=np.array(log_dict["system/grad_norm"]),
-                obs_has_nan_or_inf=np.array(log_dict["system/obs_has_nan_or_inf"]),
-
-                # Charts
-                learning_rate=np.array(log_dict["charts/learning_rate"]),
-
-                # Global step
-                global_step_np=np.array(global_step),
             )
             last_numpy_save_t = now
 
@@ -366,17 +323,7 @@ def train(cfg, env, path):
         global_step,
         agent,
         optimizer,
-        block=True,
 
-        # Rollout data
-        obs=obs.cpu().numpy(),
-        actions=actions.cpu().numpy(),
-        logprobs=logprobs.cpu().numpy(),
-        rewards=rewards.cpu().numpy(),
-        dones=dones.cpu().numpy(),
-        values=values.cpu().numpy(),
-        returns=returns.cpu().numpy(),
-        test=pg_loss.item()
     )
 
     wandb.finish()
@@ -404,14 +351,7 @@ def write_checkpoint(step_dir, model_dir, global_step, agent_state, optimizer_st
         os.makedirs(model_dir, exist_ok=True)
 
         # --- rollout arrays (atomic write) ---
-        # Save numpy arrays
-        step_dir = os.path.join(step_dir, "numpy", f"step_{global_step}")
-        os.makedirs(step_dir, exist_ok=True)
 
-        for name, arr in arrays.items():
-            np.save(os.path.join(step_dir, f"{name}.npy"), arr)
-
-        print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
 
         # --- model + optimizer (atomic write) ---
         model_path = os.path.join(model_dir, f"ppo_step_{global_step}.pt")

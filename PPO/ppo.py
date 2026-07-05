@@ -14,17 +14,13 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from gymnasium.wrappers import FlattenObservation
-from RLfoundry.PPO.Agent import Agent
+from RLfoundry.PPO.Agent import Agent  # Ensure this is updated to Categorical!
 from RLfoundry.Utils.run_startup import run_startup
-
 from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
 
 def train(cfg, env, path):
-    # run startup
     path = run_startup(path, cfg)
-
 
     wandb.init(
         project=cfg.wandb_project_name,
@@ -39,24 +35,19 @@ def train(cfg, env, path):
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    # Cuda and device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     agent = Agent(env).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
 
     # ---- pre-allocated storage for one rollout's worth of data ----
-    # BipedalWalker: obs=(24,), actions=(4,)
     obs = torch.zeros((cfg.num_steps,) + env.observation_space.shape).to(device)
-    actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
 
-    # Buffer to store the CLIPPED actions for accurate Wandb logging
-    clipped_actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
+    # DISCRETE CHANGE: Actions are scalar integers, not continuous vectors
+    actions = torch.zeros(cfg.num_steps, dtype=torch.long).to(device)
 
     logprobs = torch.zeros(cfg.num_steps).to(device)
     rewards = torch.zeros(cfg.num_steps).to(device)
@@ -66,25 +57,17 @@ def train(cfg, env, path):
     global_step = 0
     next_obs_np, _ = env.reset(seed=cfg.seed)
     next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
-
     next_done = torch.zeros(1).to(device)
     start_time = time.time()
 
     current_ep_return = 0.0
     current_ep_length = 0
 
-    # ========================================================================
-    # OUTER LOOP
-    # ========================================================================
     for iteration in range(1, cfg.num_iterations + 1):
-
         if cfg.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / cfg.num_iterations
             optimizer.param_groups[0]["lr"] = frac * cfg.learning_rate
 
-        # ====================================================================
-        # Collect trajectories
-        # ========================================================================
         for step in range(0, cfg.num_steps):
             global_step += 1
             obs[step] = next_obs
@@ -94,33 +77,24 @@ def train(cfg, env, path):
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
 
-            # Store raw action for PPO importance sampling ratio
             actions[step] = action
             logprobs[step] = logprob
 
-            # Convert and clip action for the environment (BipedalWalker bounds: [-1.0, 1.0])
-            action_np = action.detach().cpu().numpy().reshape(-1)
-            action_np_clipped = np.clip(action_np, env.action_space.low, env.action_space.high)
+            # DISCRETE CHANGE: No clipping needed. Just extract the integer action.
+            action_np = action.item()
 
-            # Store clipped action for Wandb logging
-            clipped_actions[step] = torch.as_tensor(action_np_clipped, dtype=torch.float32, device=device)
-
-            # Step the environment. It will run until termination (fall) or truncation (1600 steps)
-            next_obs_np, reward, terminations, truncations, info = env.step(action_np_clipped)
-
+            next_obs_np, reward, terminations, truncations, info = env.step(action_np)
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = float(reward)
 
             current_ep_return += float(reward)
             current_ep_length += 1
 
-            # "do the action until it all gone" -> reset when episode ends and keep going
             if next_done:
                 if getattr(cfg, "debug_episode_prints", False):
                     print(
                         f"[episode end] global_step={global_step} return={current_ep_return:.2f} length={current_ep_length}")
 
-                # Reset environment to continue taking actions in the next episode
                 next_obs_np, info = env.reset()
 
                 if cfg.track:
@@ -137,9 +111,7 @@ def train(cfg, env, path):
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(next_done, dtype=torch.float32, device=device)
 
-        # ====================================================================
-        # GAE (Generalized Advantage Estimation)
-        # ====================================================================
+        # GAE Calculation (Remains exactly the same)
         with torch.no_grad():
             next_value = agent.get_value(next_obs).flatten()
             advantages = torch.zeros_like(rewards).to(device)
@@ -157,22 +129,16 @@ def train(cfg, env, path):
                 advantages[t] = lastgaelam = (
                         delta + cfg.gamma * cfg.gae_lambda * nextnonterminal * lastgaelam
                 )
-
             returns = advantages + values
 
-        obs_space = env.observation_space
-        act_space = env.action_space
-
-        b_obs = obs.reshape((-1,) + obs_space.shape)
+        b_obs = obs.reshape((-1,) + env.observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + act_space.shape)
+        b_actions = actions.reshape(-1)  # Flattened 1D tensor of integers
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # ====================================================================
         # PPO-Clip update
-        # ========================================================================
         b_inds = np.arange(cfg.batch_size)
         for epoch in range(cfg.update_epochs):
             np.random.shuffle(b_inds)
@@ -181,8 +147,9 @@ def train(cfg, env, path):
                 end = start + cfg.minibatch_size
                 mb_inds = b_inds[start:end]
 
+                # DISCRETE CHANGE: Cast actions to long for the Categorical distribution
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
+                    b_obs[mb_inds], b_actions.long()[mb_inds]
                 )
 
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -219,21 +186,13 @@ def train(cfg, env, path):
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
                 optimizer.step()
 
-
-
         sps = int(global_step / (time.time() - start_time))
         print("SPS:", sps)
 
-        # ====================================================================
-        # LOGGING TO WANDB (Organized by category for legibility)
-        # ====================================================================
-
+        # LOGGING TO WANDB
         log_dict = {}
-
-        # --- 1. REWARDS --S    -
         log_dict["rewards/mean"] = rewards.mean().item()
 
-        # --- 2. LOSSES & OPTIMIZATION ---
         y_pred = b_values.cpu().numpy()
         y_true = b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -248,32 +207,15 @@ def train(cfg, env, path):
             "losses/explained_variance": explained_var,
         })
 
-        # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-        actions_np = clipped_actions.detach().cpu().numpy()
-        actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-        action_dim_means = actions_flat.mean(axis=0)
-        action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
+        # DISCRETE CHANGE: Log action probabilities instead of continuous mean/std
+        actions_np = actions.detach().cpu().numpy()
+        action_counts = np.bincount(actions_np, minlength=env.action_space.n)
+        action_probs = action_counts / max(action_counts.sum(), 1)
 
-        log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-        for dim_idx in range(actions_flat.shape[-1]):
-            log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+        for dim_idx, prob in enumerate(action_probs):
+            log_dict[f"actions/prob_dim{dim_idx}"] = float(prob)
 
-        # --- 4. ACTIONS: std (aggregate + per-dim) ---
-        log_dict.update({
-            "actions_std/aggregate": float(action_std_per_dim.mean()),
-            "actions_std/min": float(action_std_per_dim.min()),
-            "actions_std/max": float(action_std_per_dim.max()),
-            "actions_std/frac_at_clip_bounds": float(
-                np.mean(
-                    (actions_np <= env.action_space.low + 1e-3)
-                    | (actions_np >= env.action_space.high - 1e-3)
-                )
-            ),
-        })
-        for dim_idx, std_val in enumerate(action_std_per_dim):
-            log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
-
-        # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
+        # Observation logging (Remains the same)
         obs_np = obs.detach().cpu().numpy()
         obs_flat = obs_np.reshape(obs_np.shape[0], -1)
         obs_dim_means = obs_flat.mean(axis=0)
@@ -282,107 +224,55 @@ def train(cfg, env, path):
         log_dict["observations_mean/aggregate"] = float(obs_np.mean())
         for dim_idx in range(obs_flat.shape[-1]):
             log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-
-        # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
         log_dict["observations_std/aggregate"] = float(obs_np.std())
         for dim_idx in range(obs_flat.shape[-1]):
             log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
 
-        # --- 7. SYSTEM (throughput + health diagnostics) ---
         obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
         log_dict.update({
             "system/SPS": sps,
             "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
             "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-        })
-
-        # --- 8. CHARTS ---
-        log_dict.update({
             "charts/learning_rate": optimizer.param_groups[0]["lr"],
         })
 
         wandb.log(log_dict, step=global_step)
 
-        # ====================================================================
-        # CHECKPOINTING
-        # ====================================================================
+        # CHECKPOINTING (Removed continuous action stats to prevent KeyErrors)
         now = time.time()
         if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
             save_checkpoint(
-                path,
-                global_step,
-                agent,
-                optimizer,
-                block=True,
-
-                # Rollout data
-                obs=obs.cpu().numpy(),
-                actions=actions.cpu().numpy(),
-                logprobs=logprobs.cpu().numpy(),
-                rewards=rewards.cpu().numpy(),
-                dones=dones.cpu().numpy(),
-                values=values.cpu().numpy(),
-                returns=returns.cpu().numpy(),
-                advantages=advantages.cpu().numpy(),
-
-                # Rewards
+                path, global_step, agent, optimizer, block=True,
+                obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
+                logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
+                dones=dones.cpu().numpy(), values=values.cpu().numpy(),
+                returns=returns.cpu().numpy(), advantages=advantages.cpu().numpy(),
                 rewards_mean=np.array(log_dict["rewards/mean"]),
-
-                # Losses
                 policy_loss=np.array(log_dict["losses/policy_loss"]),
                 value_loss=np.array(log_dict["losses/value_loss"]),
                 entropy=np.array(log_dict["losses/entropy"]),
                 old_approx_kl=np.array(log_dict["losses/old_approx_kl"]),
                 approx_kl=np.array(log_dict["losses/approx_kl"]),
                 explained_variance=np.array(log_dict["losses/explained_variance"]),
-
-                # Action statistics
-                actions_mean_aggregate=np.array(log_dict["actions_mean/aggregate"]),
-                actions_std_aggregate=np.array(log_dict["actions_std/aggregate"]),
-                actions_std_min=np.array(log_dict["actions_std/min"]),
-                actions_std_max=np.array(log_dict["actions_std/max"]),
-                actions_std_frac_at_clip_bounds=np.array(log_dict["actions_std/frac_at_clip_bounds"]),
-
-                # Observation statistics
-                observations_mean_aggregate=np.array(log_dict["observations_mean/aggregate"]),
-                observations_std_aggregate=np.array(log_dict["observations_std/aggregate"]),
-
-                # System
                 SPS=np.array(log_dict["system/SPS"]),
                 grad_norm=np.array(log_dict["system/grad_norm"]),
                 obs_has_nan_or_inf=np.array(log_dict["system/obs_has_nan_or_inf"]),
-
-                # Charts
                 learning_rate=np.array(log_dict["charts/learning_rate"]),
-
-                # Global step
                 global_step_np=np.array(global_step),
             )
             last_numpy_save_t = now
 
     # Final save
     save_checkpoint(
-        path,
-        global_step,
-        agent,
-        optimizer,
-        block=True,
-
-        # Rollout data
-        obs=obs.cpu().numpy(),
-        actions=actions.cpu().numpy(),
-        logprobs=logprobs.cpu().numpy(),
-        rewards=rewards.cpu().numpy(),
-        dones=dones.cpu().numpy(),
-        values=values.cpu().numpy(),
-        returns=returns.cpu().numpy(),
-        test=pg_loss.item()
+        path, global_step, agent, optimizer, block=True,
+        obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
+        logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
+        dones=dones.cpu().numpy(), values=values.cpu().numpy(),
+        returns=returns.cpu().numpy(), test=pg_loss.item()
     )
 
     wandb.finish()
-
     env.close()
-
 
 
 
@@ -474,3 +364,5 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+# ... (Keep your clone_optimizer_state, write_checkpoint, save_checkpoint, and hydra main functions exactly as they were) ...
