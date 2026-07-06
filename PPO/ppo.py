@@ -14,7 +14,7 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from RLfoundry.PPO.Agent import Agent  # Ensure this is updated to Categorical!
+from RLfoundry.PPO.AgentDiscrete import Agent  # Ensure this is updated to Categorical!
 from RLfoundry.Utils.run_startup import run_startup
 from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
@@ -83,9 +83,8 @@ def train(cfg, env, path):
             # DISCRETE CHANGE: No clipping needed. Just extract the integer action.
             action_np = action.item()
 
-            next_obs_np, reward, terminations, truncations, info = env.step(action_np)
-            next_done = np.logical_or(terminations, truncations)
-            rewards[step] = float(reward)
+            next_obs_np, reward, terminations, truncations, info = env.step((action_np,))
+
 
             current_ep_return += float(reward)
             current_ep_length += 1

@@ -17,7 +17,7 @@ class Agent(nn.Module):
         obs_dim = env.observation_space.shape[0]  # e.g. 4 for CartPole
 
 
-        act_dim = env.action_space.n
+        act_dim = env.action_space[0].n
 
 
         self.critic = nn.Sequential(
