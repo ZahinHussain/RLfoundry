@@ -46,13 +46,12 @@ def train(cfg, env, path):
     # ==================================================
     # PPO TRAINING CODE GOES HERE
     # ==================================================
-
-    # Cude and device setup
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and cfg.cuda:
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
+    # Cude and device setup
         device = torch.device("cpu")
     agent = Agent(env, cfg.rpo_alpha).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
