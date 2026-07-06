@@ -1,27 +1,36 @@
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import copy
-import random
-import time
 import os
+import random
 import threading
+import time
 
-import hydra
 import gymnasium as gym
+import hydra
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from gymnasium.wrappers import FlattenObservation
-from RLfoundry.RPO.Agent import Agent
+from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
+from SACNetwork import SoftQNetwork, Actor
+
 from RLfoundry.Utils.run_startup import run_startup
 
-from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
+# ==============================================================================
+# Main training loop
+# ==============================================================================
 
 def train(cfg, env, path):
+    # ------------------------------------------------------------------
+    # Config + run naming
+    # ------------------------------------------------------------------
+
     # run startup
     path = run_startup(path, cfg)
 
@@ -31,443 +40,400 @@ def train(cfg, env, path):
         config=OmegaConf.to_container(cfg, resolve=True),
         name=os.path.basename(path),
         group=cfg.env_id,
-        job_type=getattr(cfg, "algo_name", "rpo"),
+        job_type=getattr(cfg, "algo_name", "sac"),
         mode="offline" if cfg.get("wandb_offline", False) else "online",
     )
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
 
-    # TRY NOT TO MODIFY: seeding
+    # ------------------------------------------------------------------
+    # Seeding
+    # ------------------------------------------------------------------
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
+    torch.backends.cudnn.deterministic = cfg.torch_deterministic
 
-    # ==================================================
-    # PPO TRAINING CODE GOES HERE
-    # ==================================================
+    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
 
-    # Cude and device setup
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+    # ------------------------------------------------------------------
+    # Networks
+    # Actor + twin Q-networks + target networks (SAC uses two Q-networks
+    # to reduce overestimation bias; targets are updated via Polyak averaging)
+    # ------------------------------------------------------------------
+    actor = Actor(env).to(device)
+    qf1 = SoftQNetwork(env).to(device)
+    qf2 = SoftQNetwork(env).to(device)
+    qf1_target = SoftQNetwork(env).to(device)
+    qf2_target = SoftQNetwork(env).to(device)
+    qf1_target.load_state_dict(qf1.state_dict())
+    qf2_target.load_state_dict(qf2.state_dict())
+
+    # Separate optimizers: one for both Q-networks, one for the actor
+    q_optimizer = optim.Adam(
+        list(qf1.parameters()) + list(qf2.parameters()), lr=cfg.q_lr
+    )
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=cfg.policy_lr)
+
+    # ------------------------------------------------------------------
+    # Automatic entropy tuning
+    # Target entropy = -|A| (heuristic from Haarnoja et al. 2018)
+    # log_alpha is learned; alpha = exp(log_alpha) stays positive
+    # ------------------------------------------------------------------
+    if cfg.autotune:
+        target_entropy = -torch.prod(
+            torch.Tensor(env.single_action_space.shape).to(device)
+        ).item()
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        alpha = log_alpha.exp().item()
+        a_optimizer = optim.Adam([log_alpha], lr=cfg.q_lr)
     else:
-        device = torch.device("cpu")
-    agent = Agent(env, cfg.rpo_alpha).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
+        log_alpha = None
+        a_optimizer = None
+        alpha = cfg.alpha
 
-    # ---- pre-allocated storage for one rollout's worth of data ----
-    obs = torch.zeros((cfg.num_steps,) + env.observation_space.shape).to(device)
-    actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
+    # ------------------------------------------------------------------
+    # Replay buffer
+    # ------------------------------------------------------------------
+    env.single_observation_space.dtype = np.float32
+    rb = ReplayBuffer(
+        cfg.buffer_size,
+        env.single_observation_space,
+        env.single_action_space,
+        device,
+        n_envs=cfg.num_envs,
+        handle_timeout_termination=False,
+    )
 
-    # Buffer to store the CLIPPED actions for accurate Wandb logging
-    clipped_actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
+    # ------------------------------------------------------------------
+    # Checkpoint threading state
+    # ------------------------------------------------------------------
 
-    logprobs = torch.zeros(cfg.num_steps).to(device)
-    rewards = torch.zeros(cfg.num_steps).to(device)
-    dones = torch.zeros(cfg.num_steps).to(device)
-    values = torch.zeros(cfg.num_steps).to(device)
+    # Metric history lists (saved as numpy arrays at each checkpoint)
+    qf1_loss_history = []
+    actor_loss_history = []
+    episodic_return_history = []
 
-    global_step = 0
-    next_obs_np, _ = env.reset(seed=cfg.seed)
-    next_obs = torch.tensor(next_obs_np, dtype=torch.float32).to(device)
-    next_done = torch.zeros(1).to(device)
     start_time = time.time()
 
-    current_ep_return = 0.0
-    current_ep_length = 0
+    # ==================================================================
+    # Main loop
+    # ==================================================================
+    obs, _ = env.reset(seed=cfg.seed)
 
-    # ========================================================================
-    # [LINE 2] OUTER LOOP ? one iteration = one full "collect, then update" cycle
-    # ========================================================================
-    for iteration in range(1, cfg.num_iterations + 1):
+    for global_step in range(cfg.total_timesteps):
 
-        if cfg.anneal_lr:
-            # [EXTRA] linearly shrink the learning rate as training progresses
-            frac = 1.0 - (iteration - 1.0) / cfg.num_iterations
-            optimizer.param_groups[0]["lr"] = frac * cfg.learning_rate
+        # --------------------------------------------------------------
+        # Action selection
+        # Before learning starts: random exploration
+        # After: sample from the stochastic actor (reparameterisation trick)
+        # --------------------------------------------------------------
+        if global_step < cfg.learning_starts:
+            actions = np.array([env.single_action_space.sample()
+                                for _ in range(env.num_envs)])
+        else:
+            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            actions = actions.detach().cpu().numpy()
 
-        # ====================================================================
-        # [LINE 3] "Collect set of trajectories D_k by running policy pi_k"
-        # ====================================================================
+        # --------------------------------------------------------------
+        # Step environment
+        # --------------------------------------------------------------
+        next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
-        for step in range(0, cfg.num_steps):
-            global_step += 1
-            obs[step] = next_obs
-            dones[step] = next_done
+        # Log episodic returns when an episode finishes
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if info is not None:
+                    ep_return = info["episode"]["r"]
+                    ep_length = info["episode"]["l"]
+                    print(f"global_step={global_step}, episodic_return={ep_return}")
 
-            # no_grad: we are NOT training right now, just acting in the
-            # environment and recording what happens. Gradients only get
-            # computed later, during the update phase.
+                    episodic_return_history.append(ep_return)
+
+                    if cfg.track:
+                        wandb.log({
+                            "charts/episodic_return": ep_return,
+                            "charts/episodic_length": ep_length,
+                        }, step=global_step)
+                    break
+
+        # Handle truncation: use `final_observation` so the bootstrap target
+        # is not poisoned by the reset observation
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_observation"][idx]
+
+        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        obs = next_obs
+
+        # ==============================================================
+        # Training updates (only after replay buffer has enough data)
+        # ==============================================================
+        if global_step > cfg.learning_starts:
+
+            data = rb.sample(cfg.batch_size)
+
+            # ----------------------------------------------------------
+            # Critic update
+            # Compute SAC Bellman target:
+            #   y = r + γ(1-d) * [min_Q(s', ã') - α * log π(ã'|s')]
+            # where ã' ~ π(·|s')
+            # ----------------------------------------------------------
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                next_state_actions, next_state_log_pi, _ = actor.get_action(
+                    data.next_observations
+                )
+                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                # Take the pessimistic (min) estimate to reduce overestimation
+                min_qf_next_target = (
+                        torch.min(qf1_next_target, qf2_next_target)
+                        - alpha * next_state_log_pi
+                )
+                next_q_value = data.rewards.flatten() + (
+                        (1 - data.dones.flatten()) * cfg.gamma * min_qf_next_target.view(-1)
+                )
 
-            # Store raw action for PPO importance sampling ratio
-            actions[step] = action
-            logprobs[step] = logprob
+            qf1_a_values = qf1(data.observations, data.actions).view(-1)
+            qf2_a_values = qf2(data.observations, data.actions).view(-1)
+            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
 
-            # step the actual environment forward
-            action_np = action.detach().cpu().numpy().reshape(-1)  # always gives 1D (act_dim,)
-            action_np_clipped = np.clip(action_np, env.action_space.low, env.action_space.high)
+            q_optimizer.zero_grad()
+            qf_loss.backward()
+            q_optimizer.step()
 
-            # Store clipped action for Wandb logging
-            clipped_actions[step] = torch.as_tensor(action_np_clipped, dtype=torch.float32, device=device)
+            # ----------------------------------------------------------
+            # Actor + alpha update (TD3-style delayed policy update)
+            # Actor maximises E[min_Q(s, ã) - α * log π(ã|s)]
+            # Alpha minimises E[-log_α * (log π + H̄)]  where H̄ = target_entropy
+            # ----------------------------------------------------------
+            if global_step % cfg.policy_frequency == 0:
+                # Repeat actor update `policy_frequency` times to compensate
+                # for the delay (keeps actor/critic update ratio ~1:1)
+                for _ in range(cfg.policy_frequency):
+                    pi, log_pi, _ = actor.get_action(data.observations)
+                    qf1_pi = qf1(data.observations, pi)
+                    qf2_pi = qf2(data.observations, pi)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
-            next_obs_np, reward, terminations, truncations, info = env.step(action_np_clipped)
+                    # Entropy-regularised actor loss
+                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-            next_done = np.logical_or(terminations, truncations)
-            rewards[step] = float(reward)
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
 
-            current_ep_return += float(reward)
-            current_ep_length += 1
+                    if cfg.autotune:
+                        with torch.no_grad():
+                            _, log_pi, _ = actor.get_action(data.observations)
+                        alpha_loss = (
+                                -log_alpha.exp() * (log_pi + target_entropy)
+                        ).mean()
 
-            # "do the action until it all gone" -> reset when episode ends and keep going
-            if next_done:
-                if getattr(cfg, "debug_episode_prints", False):
-                    print(
-                        f"[episode end] global_step={global_step} return={current_ep_return:.2f} length={current_ep_length}")
+                        a_optimizer.zero_grad()
+                        alpha_loss.backward()
+                        a_optimizer.step()
+                        alpha = log_alpha.exp().item()
 
-                # Reset environment to continue taking actions in the next episode
-                next_obs_np, info = env.reset()
+                qf1_loss_history.append(qf1_loss.item())
+                actor_loss_history.append(actor_loss.item())
 
                 if cfg.track:
-                    ep_return = info["episode"]["r"] if "episode" in info else current_ep_return
-                    ep_length = info["episode"]["l"] if "episode" in info else current_ep_length
-                    wandb.log({
-                        "charts/episodic_return": ep_return,
-                        "charts/episodic_length": ep_length,
-                    }, step=global_step)
+                    log_dict = {}
 
-                current_ep_return = 0.0
-                current_ep_length = 0
+                    # --- 1. REWARDS ---
+                    log_dict["rewards/mean"] = data.rewards.mean().item()
 
-            next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(next_done, dtype=torch.float32, device=device)
+                    # --- 2. LOSSES & OPTIMIZATION ---
+                    y_pred = qf1_a_values.detach().cpu().numpy()
+                    y_true = next_q_value.detach().cpu().numpy()
+                    var_y = np.var(y_true)
+                    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # ====================================================================
-        # [LINE 4 + 5] "Compute rewards-to-go" + "Compute advantage estimates"
-        #
-        # NOTE: this implementation computes them TOGETHER via GAE, which is
-        # a deviation from the pseudocode worth naming explicitly in your
-        # dissertation. Spinning Up's pseudocode treats rewards-to-go as a
-        # Monte Carlo target computed independently of advantages. CleanRL
-        # (like most modern PPO code) instead computes GAE advantages first,
-        # THEN derives the value-function target as returns = advantages + values.
-        # This is lower-variance and is the de facto standard, but it's
-        # technically GAE-PPO, not literal vanilla PPO-Clip.
-        # ====================================================================
-        with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
+                    log_dict.update({
+                        "losses/actor_loss": actor_loss.item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item(),
+                        "losses/alpha": alpha,
+                        "losses/entropy": (-log_pi).mean().item(),
+                        "losses/explained_variance": explained_var,
+                    })
+                    if cfg.autotune:
+                        log_dict["losses/alpha_loss"] = alpha_loss.item()
 
-            # walk BACKWARD through the rollout ? this is the standard GAE
-            # recursive computation, equivalent to (but far cheaper than)
-            # summing an infinite series of discounted TD errors
-            for t in reversed(range(cfg.num_steps)):
-                if t == cfg.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
+                    # --- 3. ACTIONS: mean (aggregate + per-dim) ---
+                    actions_np = pi.detach().cpu().numpy()
+                    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+                    action_dim_means = actions_flat.mean(axis=0)
+                    action_std_per_dim = actions_flat.std(axis=0)
 
-                # TD error / "surprise" at this timestep:
-                # actual reward + discounted next value, minus what we predicted
-                delta = rewards[t] + cfg.gamma * nextvalues * nextnonterminal - values[t]
-                # GAE: exponentially-weighted sum of TD errors going forward,
-                # computed efficiently backward
-                advantages[t] = lastgaelam = (
-                        delta + cfg.gamma * cfg.gae_lambda * nextnonterminal * lastgaelam
-                )
+                    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+                    for dim_idx in range(actions_flat.shape[-1]):
+                        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
 
-            # [LINE 4] the value function's regression TARGET ? this stands
-            # in for "rewards-to-go" in the pseudocode
-            returns = advantages + values
+                    # --- 4. ACTIONS: std (aggregate + per-dim) ---
+                    log_dict.update({
+                        "actions_std/aggregate": float(action_std_per_dim.mean()),
+                        "actions_std/min": float(action_std_per_dim.min()),
+                        "actions_std/max": float(action_std_per_dim.max()),
+                        "actions_std/frac_at_clip_bounds": float(
+                            np.mean(
+                                (actions_np <= env.single_action_space.low + 1e-3)
+                                | (actions_np >= env.single_action_space.high - 1e-3)
+                            )
+                        ),
+                    })
+                    for dim_idx, std_val in enumerate(action_std_per_dim):
+                        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
 
-        obs_space = env.observation_space
-        act_space = env.action_space
+                    # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
+                    obs_np = data.observations.detach().cpu().numpy()
+                    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+                    obs_dim_means = obs_flat.mean(axis=0)
+                    obs_dim_stds = obs_flat.std(axis=0)
 
-        # ---- pre-allocated storage for one rollout's worth of data ----
-        # [LINE 3] this is where D_k actually lives, as plain tensors rather
-        # than a list of trajectory objects ? much faster on GPU
+                    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+                    for dim_idx in range(obs_flat.shape[-1]):
+                        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
 
-        # flatten (num_steps, num_env, ...) -> (num_steps * num_env, ...)
-        # so all parallel environments' data gets mixed together into one
-        # big pool for minibatching
-        b_obs = obs.reshape((-1,) + obs_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + act_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+                    # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
+                    log_dict["observations_std/aggregate"] = float(obs_np.std())
+                    for dim_idx in range(obs_flat.shape[-1]):
+                        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
 
-        # ====================================================================
-        # [LINE 6 + 7] "Update the policy by maximizing PPO-Clip objective"
-        #              "Fit value function by regression on MSE"
-        #
-        # These happen TOGETHER, in the same loop, on the same minibatches,
-        # combined into one scalar loss per minibatch. The pseudocode lists
-        # them as two separate steps, but in practice they share one
-        # optimizer and one backward pass for efficiency.
-        # ====================================================================
-        b_inds = np.arange(cfg.batch_size)
-        for epoch in range(cfg.update_epochs):
-            # reshuffle which data goes in which minibatch every epoch ?
-            # standard SGD practice, prevents the network from learning
-            # spurious orderings
-            np.random.shuffle(b_inds)
+                    # --- 7. SYSTEM (throughput + health diagnostics) ---
+                    obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
+                    log_dict.update({
+                        "system/SPS": int(global_step / (time.time() - start_time)),
+                        "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
+                    })
 
-            for start in range(0, cfg.batch_size, cfg.minibatch_size):
-                end = start + cfg.minibatch_size
-                mb_inds = b_inds[start:end]
+                    # --- 8. CHARTS ---
+                    log_dict.update({
+                        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
+                        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
+                    })
 
-                # re-run the CURRENT (possibly already-updated-this-epoch)
-                # policy on the OLD states/actions, to get a fresh log-prob
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
-                )
+                    wandb.log(log_dict, step=global_step)
 
-                # ---- THE CORE PPO RATIO ----
-                # log(pi_new) - log(pi_old), exponentiated -> pi_new/pi_old
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-
-                mb_advantages = b_advantages[mb_inds]
-                if cfg.norm_adv:
-                    # FIX: Added correction=0 to prevent NaN when minibatch size is 1
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std(correction=0) + 1e-8)
-                # ---- [LINE 6] THE PPO-CLIP OBJECTIVE ITSELF ----
-                # Spinning Up's formula:
-                #   L = min( ratio * A_hat,  clip(ratio, 1-eps, 1+eps) * A_hat )
-                # We want to MAXIMIZE this, but PyTorch optimizers MINIMIZE,
-                # so everything below is negated (hence -mb_advantages and
-                # torch.max instead of torch.min ? negating min(a,b) gives
-                # max(-a,-b))
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # ---- [LINE 8] VALUE FUNCTION MSE REGRESSION ----
-                newvalue = newvalue.view(-1)
-                if cfg.clip_vloss:
-                    # [EXTRA] clipped value loss ? not in pseudocode, but
-                    # mirrors the policy clip: don't let the value estimate
-                    # move too far from its old value in one update
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds], -cfg.clip_coef, cfg.clip_coef
+            # ----------------------------------------------------------
+            # Target network Polyak update
+            # θ_target ← τ * θ + (1 - τ) * θ_target
+            # ----------------------------------------------------------
+            if global_step % cfg.target_network_frequency == 0:
+                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                    target_param.data.copy_(
+                        cfg.tau * param.data + (1 - cfg.tau) * target_param.data
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-                else:
-                    # plain MSE ? this is the literal pseudocode line 8
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                    target_param.data.copy_(
+                        cfg.tau * param.data + (1 - cfg.tau) * target_param.data
+                    )
 
-                # [EXTRA] entropy bonus ? encourages exploration, not in
-                # pseudocode at all
-                entropy_loss = entropy.mean()
-
-                # ---- COMBINE EVERYTHING INTO ONE LOSS ----
-                # policy loss MINUS entropy bonus (we want to ENCOURAGE
-                # entropy, hence the minus sign on a term we're minimizing)
-                # PLUS value loss weighted by vf_coef
-                loss = pg_loss - cfg.ent_coef * entropy_loss + v_loss * cfg.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-                # [EXTRA] clip gradients so no single update is too violent
-                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-
-            # [EXTRA] optional early stopping if policy is changing too fast
-
-            ''''
-
-            if cfg.target_kl is not None and approx_kl > cfg.target_kl:
-                break
-                '''
-
-        sps = int(global_step / (time.time() - start_time))
-        print("SPS:", sps)
-
-        # ====================================================================
-        # LOGGING TO WANDB (Organized by category for legibility)
-        # ====================================================================
-
-        log_dict = {}
-
-        # --- 1. REWARDS --S    -
-        log_dict["rewards/mean"] = rewards.mean().item()
-
-        # --- 2. LOSSES & OPTIMIZATION ---
-        y_pred = b_values.cpu().numpy()
-        y_true = b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        log_dict.update({
-            "losses/policy_loss": pg_loss.item(),
-            "losses/value_loss": v_loss.item(),
-            "losses/entropy": entropy_loss.item(),
-            "losses/old_approx_kl": old_approx_kl.item(),
-            "losses/approx_kl": approx_kl.item(),
-            "losses/explained_variance": explained_var,
-        })
-
-        # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-        actions_np = clipped_actions.detach().cpu().numpy()
-        actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-        action_dim_means = actions_flat.mean(axis=0)
-        action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
-
-        log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-        for dim_idx in range(actions_flat.shape[-1]):
-            log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
-
-        # --- 4. ACTIONS: std (aggregate + per-dim) ---
-        log_dict.update({
-            "actions_std/aggregate": float(action_std_per_dim.mean()),
-            "actions_std/min": float(action_std_per_dim.min()),
-            "actions_std/max": float(action_std_per_dim.max()),
-            "actions_std/frac_at_clip_bounds": float(
-                np.mean(
-                    (actions_np <= env.action_space.low + 1e-3)
-                    | (actions_np >= env.action_space.high - 1e-3)
+            # ----------------------------------------------------------
+            # Async checkpoint (threaded, deep-copy before dispatch)
+            # ----------------------------------------------------------
+            now = time.time()
+            if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
+                save_checkpoint(
+                    path,
+                    global_step=cfg.total_timesteps,
+                    actor=actor,
+                    qf1=qf1,
+                    qf2=qf2,
+                    qf1_target=qf1_target,
+                    qf2_target=qf2_target,
+                    actor_optimizer=actor_optimizer,
+                    q_optimizer=q_optimizer,
+                    log_alpha=log_alpha,
+                    a_optimizer=a_optimizer,
                 )
-            ),
-        })
-        for dim_idx, std_val in enumerate(action_std_per_dim):
-            log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
 
-        # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
-        obs_np = obs.detach().cpu().numpy()
-        obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-        obs_dim_means = obs_flat.mean(axis=0)
-        obs_dim_stds = obs_flat.std(axis=0)
+                last_numpy_save_t = now
 
-        log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+            sps = int(global_step / (time.time() - start_time))
+            print("SPS:", sps)
 
-        # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
-        log_dict["observations_std/aggregate"] = float(obs_np.std())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+            # ------------------------------------------------------------------
+            # Final checkpoint — wait for any background thread to finish first
+            # ------------------------------------------------------------------
 
-        # --- 7. SYSTEM (throughput + health diagnostics) ---
-        obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-        log_dict.update({
-            "system/SPS": sps,
-            "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
-            "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-        })
-
-        # --- 8. CHARTS ---
-        log_dict.update({
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
-        })
-
-        wandb.log(log_dict, step=global_step)
-
-        # ====================================================================
-        # CHECKPOINTING
-        # ====================================================================
-        now = time.time()
-        if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
+            path = path + "Final"
             save_checkpoint(
                 path,
-                global_step,
-                agent,
-                optimizer,
+                global_step=cfg.total_timesteps,
+                actor=actor,
+                qf1=qf1,
+                qf2=qf2,
+                qf1_target=qf1_target,
+                qf2_target=qf2_target,
+                actor_optimizer=actor_optimizer,
+                q_optimizer=q_optimizer,
+                log_alpha=log_alpha,
+                a_optimizer=a_optimizer,
             )
-            last_numpy_save_t = now
 
-    # Final save
-    save_checkpoint(
-        path,
-        global_step,
-        agent,
-        optimizer,
-    )
+        env.close()
 
     wandb.finish()
 
-    env.close()
 
-
-def clone_optimizer_state(optimizer_state: dict) -> dict:
-    """Deep-clone all tensors inside an optimizer state_dict so the
-    background writer thread doesn't race with optimizer.step()."""
-    cloned = {"param_groups": copy.deepcopy(optimizer_state["param_groups"]), "state": {}}
-    for param_id, state in optimizer_state["state"].items():
-        cloned["state"][param_id] = {
-            k: (v.detach().cpu().clone() if torch.is_tensor(v) else copy.deepcopy(v))
-            for k, v in state.items()
-        }
-    return cloned
-
-
-def write_checkpoint(step_dir, model_dir, global_step, agent_state, optimizer_state, arrays):
-    try:
-        os.makedirs(step_dir, exist_ok=True)
-        os.makedirs(model_dir, exist_ok=True)
-
-        # --- rollout arrays (atomic write) ---
-
-        # --- model + optimizer (atomic write) ---
-        model_path = os.path.join(model_dir, f"rpo_step_{global_step}.pt")
-        model_tmp = model_path + ".tmp"
-        torch.save({
-            "agent_state_dict": agent_state,
-            "optimizer_state_dict": optimizer_state,
-            "global_step": global_step,
-        }, model_tmp)
-        os.replace(model_tmp, model_path)
-
-        print(f"[checkpoint] step {global_step} -> {step_dir}, {model_path}")
-
-    except Exception as e:
-        print(f"[checkpoint] FAILED at step {global_step}: {e}")
-
+# ==============================================================================
+# Entry point
+# ==============================================================================
 
 def save_checkpoint(
         save_dir: str,
         global_step: int,
-        agent,
-        optimizer,
-        block: bool = False,
+        actor,
+        qf1,
+        qf2,
+        qf1_target,
+        qf2_target,
+        actor_optimizer,
+        q_optimizer,
+        log_alpha=None,
+        a_optimizer=None,
         **arrays: np.ndarray,
 ) -> None:
-    """
-    Save rollout arrays and model checkpoint asynchronously.
+    # ------------------------------------------------------------------
+    # Numpy arrays (loss histories, episodic returns, etc.)
+    # ------------------------------------------------------------------
+    if arrays:
+        step_dir = os.path.join(save_dir, "numpy", f"step_{global_step}")
+        os.makedirs(step_dir, exist_ok=True)
+        for name, arr in arrays.items():
+            np.save(os.path.join(step_dir, f"{name}.npy"), arr)
+        print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
 
-    Everything is cloned/copied BEFORE the thread starts ? the main thread
-    keeps training (mutating agent/optimizer/rollout buffers in place)
-    while the background thread serializes, so anything not copied here
-    is a race condition. Writes are atomic (tmp file + os.replace) so a
-    crash mid-write can't leave a corrupted checkpoint on disk.
-    """
-    agent_state = {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()}
-    optimizer_state = clone_optimizer_state(optimizer.state_dict())
-    arrays = {k: np.array(v, copy=True) for k, v in arrays.items()}
-
+    # ------------------------------------------------------------------
+    # Model checkpoint
+    # ------------------------------------------------------------------
     model_dir = os.path.join(save_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
 
-    t = threading.Thread(
-        target=write_checkpoint,
-        args=(save_dir, model_dir, global_step, agent_state, optimizer_state, arrays),
-        daemon=True,
-    )
-    t.start()
-    if block:
-        t.join()
+    model_path = os.path.join(model_dir, f"sac_step_{global_step}.pt")
+
+    checkpoint = {
+        "actor_state_dict": actor.state_dict(),
+        "qf1_state_dict": qf1.state_dict(),
+        "qf2_state_dict": qf2.state_dict(),
+        "qf1_target_state_dict": qf1_target.state_dict(),
+        "qf2_target_state_dict": qf2_target.state_dict(),
+        "actor_optimizer_state_dict": actor_optimizer.state_dict(),
+        "q_optimizer_state_dict": q_optimizer.state_dict(),
+        "log_alpha": log_alpha.item() if log_alpha is not None else None,
+        "alpha_optimizer_state_dict": a_optimizer.state_dict() if a_optimizer is not None else None,
+        "global_step": global_step,
+    }
+
+    torch.save(checkpoint, model_path)
+    print(f"[model checkpoint] saved -> {model_path}")
 
 
 @hydra.main(

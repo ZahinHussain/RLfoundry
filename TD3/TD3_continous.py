@@ -7,6 +7,7 @@ import gymnasium as gym
 import hydra
 import numpy as np
 import torch
+import wandb
 
 import torch.optim as optim
 import torch.nn.functional as F
@@ -30,6 +31,16 @@ def train(cfg, env, path):
 
     # run startup
     path = run_startup(path, cfg)
+
+    wandb.init(
+        project=cfg.wandb_project_name,
+        entity=cfg.wandb_entity,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        name=os.path.basename(path),
+        group=cfg.env_id,
+        job_type=getattr(cfg, "algo_name", "td3"),
+        mode="offline" if cfg.get("wandb_offline", False) else "online",
+    )
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
@@ -124,8 +135,15 @@ def train(cfg, env, path):
         # Log episodic returns when an episode finishes
         if "episode" in infos:
             ep_return = infos["episode"]["r"]
+            ep_length = infos["episode"]["l"]
             print(f"global_step={global_step}, episodic_return={ep_return}")
             episodic_return_history.append(ep_return)
+
+            if cfg.track:
+                wandb.log({
+                    "charts/episodic_return": ep_return,
+                    "charts/episodic_length": ep_length,
+                }, step=global_step)
 
         # Handle truncation: use `final_observation` so the bootstrap target
         # is not poisoned by the reset observation
@@ -195,7 +213,8 @@ def train(cfg, env, path):
             # Delayed to keep actor/critic update ratio stable
             # ----------------------------------------------------------
             if global_step % cfg.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                actor_actions = actor(data.observations)
+                actor_loss = -qf1(data.observations, actor_actions).mean()
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
@@ -218,6 +237,84 @@ def train(cfg, env, path):
 
                 qf1_loss_history.append(qf1_loss.item())
                 actor_loss_history.append(actor_loss.item())
+
+                if cfg.track:
+                    log_dict = {}
+
+                    # --- 1. REWARDS ---
+                    log_dict["rewards/mean"] = data.rewards.mean().item()
+
+                    # --- 2. LOSSES & OPTIMIZATION ---
+                    y_pred = qf1_a_values.detach().cpu().numpy()
+                    y_true = next_q_value.detach().cpu().numpy()
+                    var_y = np.var(y_true)
+                    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+                    log_dict.update({
+                        "losses/actor_loss": actor_loss.item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item(),
+                        "losses/explained_variance": explained_var,
+                    })
+
+                    # --- 3. ACTIONS: mean (aggregate + per-dim) ---
+                    # TD3's actor is deterministic, so there's no learned std
+                    # parameter like PPO's actor_logstd; per-dim std here is
+                    # the empirical spread of the actor's outputs across the batch.
+                    actions_np = actor_actions.detach().cpu().numpy()
+                    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+                    action_dim_means = actions_flat.mean(axis=0)
+                    action_std_per_dim = actions_flat.std(axis=0)
+
+                    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+                    for dim_idx in range(actions_flat.shape[-1]):
+                        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+
+                    # --- 4. ACTIONS: std (aggregate + per-dim) ---
+                    log_dict.update({
+                        "actions_std/aggregate": float(action_std_per_dim.mean()),
+                        "actions_std/min": float(action_std_per_dim.min()),
+                        "actions_std/max": float(action_std_per_dim.max()),
+                        "actions_std/frac_at_clip_bounds": float(
+                            np.mean(
+                                (actions_np <= env.action_space.low + 1e-3)
+                                | (actions_np >= env.action_space.high - 1e-3)
+                            )
+                        ),
+                    })
+                    for dim_idx, std_val in enumerate(action_std_per_dim):
+                        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
+
+                    # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
+                    obs_np = data.observations.detach().cpu().numpy()
+                    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+                    obs_dim_means = obs_flat.mean(axis=0)
+                    obs_dim_stds = obs_flat.std(axis=0)
+
+                    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+                    for dim_idx in range(obs_flat.shape[-1]):
+                        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+                    # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
+                    log_dict["observations_std/aggregate"] = float(obs_np.std())
+                    for dim_idx in range(obs_flat.shape[-1]):
+                        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+                    # --- 7. SYSTEM (throughput + health diagnostics) ---
+                    obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
+                    log_dict.update({
+                        "system/SPS": int(global_step / (time.time() - start_time)),
+                        "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
+                    })
+
+                    # --- 8. CHARTS ---
+                    log_dict.update({
+                        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
+                        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
+                    })
+
+                    wandb.log(log_dict, step=global_step)
 
             # ----------------------------------------------------------
             # Async checkpoint (threaded, deep-copy before dispatch)
@@ -263,6 +360,8 @@ def train(cfg, env, path):
         actor_loss_history=np.array(actor_loss_history),
         episodic_return_history=np.array(episodic_return_history),
     )
+
+    wandb.finish()
 
     env.close()
 
