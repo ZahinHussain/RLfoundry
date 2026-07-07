@@ -1,0 +1,46 @@
+# @package _global_
+
+# TD3 Configuration
+# Generated from td3.py Args dataclass
+
+# --- General ---
+exp_name: td3
+seed: 1
+torch_deterministic: true
+cuda: true
+
+# --- Tracking ---
+track: false
+wandb_project_name: RLFoundry
+wandb_entity: null
+capture_video: false
+
+# --- Model Persistence ---
+save_model: false
+upload_model: false
+hf_entity: ""
+
+# --- Environment ---
+env_id: Hopper-v4
+num_envs: 1
+
+# --- Training ---
+total_timesteps: 1000000
+learning_rate: 3e-4
+learning_starts: 25000
+batch_size: 256
+
+# --- Replay Buffer ---
+buffer_size: 1000000
+
+# --- RL Hyperparameters ---
+gamma: 0.99
+tau: 0.005
+
+# --- TD3-Specific ---
+policy_noise: 0.2
+exploration_noise: 0.1
+policy_frequency: 2
+noise_clip: 0.5
+
+interval_save: 5

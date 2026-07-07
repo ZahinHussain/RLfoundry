@@ -1,8 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
-import copy
 import os
 import random
-import threading
 import time
 
 import gymnasium as gym
@@ -17,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
 from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
-from SACNetwork import SoftQNetwork, Actor
+from RLfoundry.SAC.SACNetwork import Actor, SoftQNetwork
 
 from RLfoundry.Utils.run_startup import run_startup
 
@@ -83,7 +81,7 @@ def train(cfg, env, path):
     # ------------------------------------------------------------------
     if cfg.autotune:
         target_entropy = -torch.prod(
-            torch.Tensor(env.single_action_space.shape).to(device)
+            torch.Tensor(env.action_space.shape).to(device)
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
@@ -96,21 +94,17 @@ def train(cfg, env, path):
     # ------------------------------------------------------------------
     # Replay buffer
     # ------------------------------------------------------------------
-    env.single_observation_space.dtype = np.float32
+    env.observation_space.dtype = np.float32
     rb = ReplayBuffer(
         cfg.buffer_size,
-        env.single_observation_space,
-        env.single_action_space,
+        env.observation_space,
+        env.action_space,
         device,
-        n_envs=cfg.num_envs,
-        handle_timeout_termination=False,
     )
 
     # ------------------------------------------------------------------
-    # Checkpoint threading state
-    # ------------------------------------------------------------------
-
     # Metric history lists (saved as numpy arrays at each checkpoint)
+    # ------------------------------------------------------------------
     qf1_loss_history = []
     actor_loss_history = []
     episodic_return_history = []
@@ -130,11 +124,10 @@ def train(cfg, env, path):
         # After: sample from the stochastic actor (reparameterisation trick)
         # --------------------------------------------------------------
         if global_step < cfg.learning_starts:
-            actions = np.array([env.single_action_space.sample()
-                                for _ in range(env.num_envs)])
+            actions = env.action_space.sample()
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            actions, _, _ = actor.get_action(torch.Tensor(obs).unsqueeze(0).to(device))
+            actions = actions.detach().cpu().numpy().squeeze(0)
 
         # --------------------------------------------------------------
         # Step environment
@@ -142,31 +135,40 @@ def train(cfg, env, path):
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
         # Log episodic returns when an episode finishes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info is not None:
-                    ep_return = info["episode"]["r"]
-                    ep_length = info["episode"]["l"]
-                    print(f"global_step={global_step}, episodic_return={ep_return}")
+        # NOTE: no `break` here — training must continue past episode boundaries.
+        if "episode" in infos:
+            ep_return = infos["episode"]["r"]
+            ep_length = infos["episode"]["l"]
+            print(f"global_step={global_step}, episodic_return={ep_return}")
+            episodic_return_history.append(ep_return)
 
-                    episodic_return_history.append(ep_return)
+            if cfg.track:
+                wandb.log({
+                    "charts/episodic_return": ep_return,
+                    "charts/episodic_length": ep_length,
+                }, step=global_step)
 
-                    if cfg.track:
-                        wandb.log({
-                            "charts/episodic_return": ep_return,
-                            "charts/episodic_length": ep_length,
-                        }, step=global_step)
-                    break
-
-        # Handle truncation: use `final_observation` so the bootstrap target
-        # is not poisoned by the reset observation
+        # ----------------------------------------------------------------
+        # Single (non-vectorized) env: `next_obs` from env.step() IS already
+        # the true final observation on truncation — Gymnasium only injects
+        # "final_observation" for vector envs with autoreset. No lookup needed.
+        # ----------------------------------------------------------------
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
 
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-        obs = next_obs
+        rb.add(
+            obs[np.newaxis],  # (obs_dim,) -> (1, obs_dim)
+            real_next_obs[np.newaxis],  # same
+            actions[np.newaxis],  # (act_dim,) -> (1, act_dim)
+            np.array([rewards]),
+            np.array([terminations]),
+            [infos],  # dict -> [dict]
+        )
+
+        # Reset on episode end, otherwise carry the obs forward
+        if terminations or truncations:
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
 
         # ==============================================================
         # Training updates (only after replay buffer has enough data)
@@ -178,8 +180,8 @@ def train(cfg, env, path):
             # ----------------------------------------------------------
             # Critic update
             # Compute SAC Bellman target:
-            #   y = r + γ(1-d) * [min_Q(s', ã') - α * log π(ã'|s')]
-            # where ã' ~ π(·|s')
+            #   y = r + gamma*(1-d) * [min_Q(s', a') - alpha * log pi(a'|s')]
+            # where a' ~ pi(.|s')
             # ----------------------------------------------------------
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(
@@ -208,8 +210,8 @@ def train(cfg, env, path):
 
             # ----------------------------------------------------------
             # Actor + alpha update (TD3-style delayed policy update)
-            # Actor maximises E[min_Q(s, ã) - α * log π(ã|s)]
-            # Alpha minimises E[-log_α * (log π + H̄)]  where H̄ = target_entropy
+            # Actor maximises E[min_Q(s, a) - alpha * log pi(a|s)]
+            # Alpha minimises E[-log_alpha * (log pi + H_target)]
             # ----------------------------------------------------------
             if global_step % cfg.policy_frequency == 0:
                 # Repeat actor update `policy_frequency` times to compensate
@@ -283,8 +285,8 @@ def train(cfg, env, path):
                         "actions_std/max": float(action_std_per_dim.max()),
                         "actions_std/frac_at_clip_bounds": float(
                             np.mean(
-                                (actions_np <= env.single_action_space.low + 1e-3)
-                                | (actions_np >= env.single_action_space.high - 1e-3)
+                                (actions_np <= env.action_space.low + 1e-3)
+                                | (actions_np >= env.action_space.high - 1e-3)
                             )
                         ),
                     })
@@ -323,7 +325,7 @@ def train(cfg, env, path):
 
             # ----------------------------------------------------------
             # Target network Polyak update
-            # θ_target ← τ * θ + (1 - τ) * θ_target
+            # theta_target <- tau * theta + (1 - tau) * theta_target
             # ----------------------------------------------------------
             if global_step % cfg.target_network_frequency == 0:
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
@@ -336,13 +338,13 @@ def train(cfg, env, path):
                     )
 
             # ----------------------------------------------------------
-            # Async checkpoint (threaded, deep-copy before dispatch)
+            # Async checkpoint (periodic, based on wall-clock interval)
             # ----------------------------------------------------------
             now = time.time()
             if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
                 save_checkpoint(
                     path,
-                    global_step=cfg.total_timesteps,
+                    global_step=global_step,
                     actor=actor,
                     qf1=qf1,
                     qf2=qf2,
@@ -352,39 +354,41 @@ def train(cfg, env, path):
                     q_optimizer=q_optimizer,
                     log_alpha=log_alpha,
                     a_optimizer=a_optimizer,
+                    qf1_loss_history=np.array(qf1_loss_history),
+                    actor_loss_history=np.array(actor_loss_history),
+                    episodic_return_history=np.array(episodic_return_history),
                 )
-
                 last_numpy_save_t = now
 
             sps = int(global_step / (time.time() - start_time))
             print("SPS:", sps)
 
-            # ------------------------------------------------------------------
-            # Final checkpoint — wait for any background thread to finish first
-            # ------------------------------------------------------------------
+    # ======================================================================
+    # Final checkpoint — runs ONCE, after the loop finishes
+    # ======================================================================
+    save_checkpoint(
+        os.path.join(path, "Final"),
+        global_step=cfg.total_timesteps,
+        actor=actor,
+        qf1=qf1,
+        qf2=qf2,
+        qf1_target=qf1_target,
+        qf2_target=qf2_target,
+        actor_optimizer=actor_optimizer,
+        q_optimizer=q_optimizer,
+        log_alpha=log_alpha,
+        a_optimizer=a_optimizer,
+        qf1_loss_history=np.array(qf1_loss_history),
+        actor_loss_history=np.array(actor_loss_history),
+        episodic_return_history=np.array(episodic_return_history),
+    )
 
-            path = path + "Final"
-            save_checkpoint(
-                path,
-                global_step=cfg.total_timesteps,
-                actor=actor,
-                qf1=qf1,
-                qf2=qf2,
-                qf1_target=qf1_target,
-                qf2_target=qf2_target,
-                actor_optimizer=actor_optimizer,
-                q_optimizer=q_optimizer,
-                log_alpha=log_alpha,
-                a_optimizer=a_optimizer,
-            )
-
-        env.close()
-
+    env.close()
     wandb.finish()
 
 
 # ==============================================================================
-# Entry point
+# Checkpoint saving
 # ==============================================================================
 
 def save_checkpoint(

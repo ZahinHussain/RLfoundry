@@ -1,0 +1,30 @@
+defaults: []
+exp_name: ppo
+env_id: default  # set per-environment, required by wandb group=
+algo_name: ppo                     # used for wandb job_type grouping
+learning_rate: 3e-4
+seed: 67
+gamma: 0.99                        # was 0.95 — too low for long-horizon SustainGym episodes
+total_timesteps: 1024000           # was inconsistent with num_iterations*batch_size; unused by loop but keep accurate
+torch_deterministic: true
+track: true
+wandb_project_name: default
+wandb_entity: null
+wandb_offline: false
+num_steps: 2048
+num_envs: 1
+num_iterations: 500
+anneal_lr: True
+gae_lambda: 0.95
+batch_size: 2048
+update_epochs: 10
+minibatch_size: 128                # was 32 — too noisy at 64 minibatches/epoch given slow envs
+norm_adv: True
+clip_coef: 0.2
+clip_vloss: True
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+target_kl: null                    # was "None" (string) — would crash on first epoch comparison
+interval_save: 30
+eps: 1e-5

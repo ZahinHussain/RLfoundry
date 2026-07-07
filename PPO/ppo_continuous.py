@@ -30,7 +30,7 @@ def train(cfg, env, path):
         project=cfg.wandb_project_name,
         entity=cfg.wandb_entity,
         config=OmegaConf.to_container(cfg, resolve=True),
-        name=os.path.basename(path),
+        name=cfg.algo_name,
         group=cfg.env_id,
         job_type=getattr(cfg, "algo_name", "ppo"),
         mode="offline" if cfg.get("wandb_offline", False) else "online",
