@@ -35,6 +35,7 @@ class PPOConfig:
     wandb_project_name: str = "default"
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
+    cuda: bool = True
 
     num_steps: int = 2048
     num_envs: int = 1
@@ -249,6 +250,7 @@ def load_cfg(algo_name: str, **overrides) -> DictConfig:
         cfg = load_cfg("ppo", env_id="BipedalWalker-v3", seed=42)
         train(cfg, env, path)
     """
+    algo_name = algo_name.lower()
     if algo_name not in _CONFIGS:
         raise ValueError(f"Unknown algo '{algo_name}'. Choose from {list(_CONFIGS)}")
 

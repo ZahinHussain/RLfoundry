@@ -15,15 +15,6 @@ def run_startup(path,cfg):
 
     txt_file_path = os.path.join(path, "config.txt")
 
-    with open(txt_file_path, "w") as f:
-        f.write(f"# Config saved for experiment: {cfg.exp_name}\n")
-        f.write("=" * 40 + "\n")
-        for key, value in cfg.items():
-            line = f"{key}: {value}"
-            print(line)
-            f.write(line + "\n")
-
-    # variables needed
 
     return path
 
