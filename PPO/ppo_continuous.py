@@ -3,7 +3,7 @@ import random
 import time
 import os
 import threading
-
+import psutil
 import hydra
 import gymnasium as gym
 import numpy as np
@@ -18,8 +18,8 @@ from gymnasium.wrappers import FlattenObservation
 from RLfoundry.PPO.Agent import Agent
 from RLfoundry.Utils.run_startup import run_startup
 
-from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
-
+_proc = psutil.Process()
+_proc.cpu_percent()  # warm-up call — first real reading needs a prior baseline
 
 def train(cfg, env, path):
     # run startup
@@ -45,7 +45,13 @@ def train(cfg, env, path):
     torch.manual_seed(cfg.seed)
 
     # Cuda and device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available() and cfg.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        # Cude and device setup
+        device = torch.device("cpu")
 
     agent = Agent(env).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
@@ -225,83 +231,19 @@ def train(cfg, env, path):
         print("SPS:", sps)
 
         # ====================================================================
-        # LOGGING TO WANDB (Organized by category for legibility)
+        # LOGGING TO WANDB
+        # BUG FIX: this block previously ran unconditionally with no
+        # `cfg.track` guard, unlike every other algorithm file. Wrapped to
+        # match convention — if cfg.track=False, wandb.log should never be
+        # called at all.
         # ====================================================================
-
-        log_dict = {}
-
-        # --- 1. REWARDS --S    -
-        log_dict["rewards/mean"] = rewards.mean().item()
-
-        # --- 2. LOSSES & OPTIMIZATION ---
-        y_pred = b_values.cpu().numpy()
-        y_true = b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        log_dict.update({
-            "losses/policy_loss": pg_loss.item(),
-            "losses/value_loss": v_loss.item(),
-            "losses/entropy": entropy_loss.item(),
-            "losses/old_approx_kl": old_approx_kl.item(),
-            "losses/approx_kl": approx_kl.item(),
-            "losses/explained_variance": explained_var,
-        })
-
-        # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-        actions_np = clipped_actions.detach().cpu().numpy()
-        actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-        action_dim_means = actions_flat.mean(axis=0)
-        action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
-
-        log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-        for dim_idx in range(actions_flat.shape[-1]):
-            log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
-
-        # --- 4. ACTIONS: std (aggregate + per-dim) ---
-        log_dict.update({
-            "actions_std/aggregate": float(action_std_per_dim.mean()),
-            "actions_std/min": float(action_std_per_dim.min()),
-            "actions_std/max": float(action_std_per_dim.max()),
-            "actions_std/frac_at_clip_bounds": float(
-                np.mean(
-                    (actions_np <= env.action_space.low + 1e-3)
-                    | (actions_np >= env.action_space.high - 1e-3)
-                )
-            ),
-        })
-        for dim_idx, std_val in enumerate(action_std_per_dim):
-            log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
-
-        # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
-        obs_np = obs.detach().cpu().numpy()
-        obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-        obs_dim_means = obs_flat.mean(axis=0)
-        obs_dim_stds = obs_flat.std(axis=0)
-
-        log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-
-        # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
-        log_dict["observations_std/aggregate"] = float(obs_np.std())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
-
-        # --- 7. SYSTEM (throughput + health diagnostics) ---
-        obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-        log_dict.update({
-            "system/SPS": sps,
-            "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
-            "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-        })
-
-        # --- 8. CHARTS ---
-        log_dict.update({
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
-        })
-
-        wandb.log(log_dict, step=global_step)
+        if cfg.track:
+            log_ppo_step(
+                global_step,  env, agent, rewards,
+                b_values, b_returns, pg_loss, v_loss, entropy_loss,
+                old_approx_kl, approx_kl, clipped_actions, obs,
+                optimizer, device,
+            )
 
         # ====================================================================
         # CHECKPOINTING
@@ -313,7 +255,6 @@ def train(cfg, env, path):
                 global_step,
                 agent,
                 optimizer,
-
             )
             last_numpy_save_t = now
 
@@ -323,12 +264,132 @@ def train(cfg, env, path):
         global_step,
         agent,
         optimizer,
-
     )
 
     wandb.finish()
 
     env.close()
+
+
+# ==============================================================================
+# Logging subroutine
+# ==============================================================================
+
+def log_ppo_step(
+    global_step, env, agent, rewards,
+    b_values, b_returns, pg_loss, v_loss, entropy_loss,
+    old_approx_kl, approx_kl, clipped_actions, obs,
+     optimizer, device,
+):
+    log_dict = {}
+
+    # --- 1. REWARDS ---
+    log_dict["rewards/mean"] = rewards.mean().item()
+
+    # --- 2. LOSSES & OPTIMIZATION ---
+    y_pred = b_values.cpu().numpy()
+    y_true = b_returns.cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+    log_dict.update({
+        "losses/policy_loss": pg_loss.item(),
+        "losses/value_loss": v_loss.item(),
+        "losses/entropy": entropy_loss.item(),
+        "losses/old_approx_kl": old_approx_kl.item(),
+        "losses/approx_kl": approx_kl.item(),
+        "losses/explained_variance": explained_var,
+    })
+
+    # --- 3. ACTIONS: mean (aggregate + per-dim) ---
+    actions_np = clipped_actions.detach().cpu().numpy()
+    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+    action_dim_means = actions_flat.mean(axis=0)
+    action_std_per_dim = torch.exp(agent.actor_logstd).detach().cpu().numpy().flatten()
+
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    for dim_idx in range(actions_flat.shape[-1]):
+        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+
+    # --- 4. ACTIONS: std (aggregate + per-dim) ---
+    log_dict.update({
+        "actions_std/aggregate": float(action_std_per_dim.mean()),
+        "actions_std/min": float(action_std_per_dim.min()),
+        "actions_std/max": float(action_std_per_dim.max()),
+        "actions_std/frac_at_clip_bounds": float(
+            np.mean(
+                (actions_np <= env.action_space.low + 1e-3)
+                | (actions_np >= env.action_space.high - 1e-3)
+            )
+        ),
+    })
+    for dim_idx, std_val in enumerate(action_std_per_dim):
+        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
+
+    # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
+    obs_np = obs.detach().cpu().numpy()
+    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
+
+    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+    # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
+    log_dict["observations_std/aggregate"] = float(obs_np.std())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+
+    # --- 8. CHARTS ---
+    log_dict.update({
+        "charts/learning_rate": optimizer.param_groups[0]["lr"],
+    })
+
+    # --- CPU (separate panel group) ---
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(1 for c in per_core if c > 20.0),
+        "cpu/num_cores": len(per_core),
+    })
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # --- RAM (separate panel group) ---
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass  # io_counters not available on macOS
+
+    # --- GPU (separate panel group) ---
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass  # pynvml not available on this driver setup
+
+    wandb.log(log_dict, step=global_step)
+
 
 
 
@@ -409,7 +470,12 @@ def save_checkpoint(
     config_name="config",
 )
 def main(cfg: DictConfig):
-    train(cfg)
+    # NOTE: same pre-existing gap as TD3/SAC — train() needs (cfg, env, path),
+    # main() only has cfg. Needs env construction + path wired in from
+    # wherever your other entry points build these.
+    raise NotImplementedError(
+        "main() must construct `env` and `path` before calling train(cfg, env, path)."
+    )
 
 
 if __name__ == "__main__":

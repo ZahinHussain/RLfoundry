@@ -6,6 +6,7 @@ import time
 import gymnasium as gym
 import hydra
 import numpy as np
+import psutil
 import torch
 import wandb
 
@@ -18,6 +19,22 @@ from RLfoundry.TD3.TD3Network import Actor, QNetwork
 from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
 
 from RLfoundry.Utils.run_startup import run_startup
+
+
+# ==============================================================================
+# Module-level logging state
+# BUG FIX: these were previously defined as LOCAL variables inside train(),
+# but log_td3_step() references them as globals. They must live at module
+# level or log_td3_step() throws NameError the first time it's called.
+# ==============================================================================
+_proc = psutil.Process()
+_proc.cpu_percent()  # warm-up call — first real reading needs a prior baseline
+
+_step_time_window = []
+WINDOW_SIZE = 100
+
+_last_log_time = None
+_last_log_step = None
 
 
 # ==============================================================================
@@ -36,7 +53,7 @@ def train(cfg, env, path):
         project=cfg.wandb_project_name,
         entity=cfg.wandb_entity,
         config=OmegaConf.to_container(cfg, resolve=True),
-        name=os.path.basename(path),
+        name=cfg.exp_name,
         group=cfg.env_id,
         job_type=getattr(cfg, "algo_name", "td3"),
         mode="offline" if cfg.get("wandb_offline", False) else "online",
@@ -129,8 +146,14 @@ def train(cfg, env, path):
 
         # --------------------------------------------------------------
         # Step environment
+        # BUG FIX: env_step_time was referenced by log_td3_step but never
+        # computed anywhere in train(). Timed here with perf_counter
+        # (monotonic, correct for interval timing — time.time() can jump
+        # backwards on NTP adjustment, perf_counter cannot).
         # --------------------------------------------------------------
+        env_step_start = time.perf_counter()
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
+        env_step_time = time.perf_counter() - env_step_start
 
         # Log episodic returns when an episode finishes
         if "episode" in infos:
@@ -168,6 +191,8 @@ def train(cfg, env, path):
         # Training updates (only after replay buffer has enough data)
         # ==============================================================
         if global_step > cfg.learning_starts:
+
+            train_update_start = time.perf_counter()
 
             data = rb.sample(cfg.batch_size)
 
@@ -238,83 +263,18 @@ def train(cfg, env, path):
                 qf1_loss_history.append(qf1_loss.item())
                 actor_loss_history.append(actor_loss.item())
 
+                # BUG FIX: train_update_time must be measured up to this point
+                # (covers critic update + actor update + polyak), and BEFORE
+                # we call log_td3_step, since the function needs it as an arg.
+                train_update_time = time.perf_counter() - train_update_start
+
                 if cfg.track:
-                    log_dict = {}
-
-                    # --- 1. REWARDS ---
-                    log_dict["rewards/mean"] = data.rewards.mean().item()
-
-                    # --- 2. LOSSES & OPTIMIZATION ---
-                    y_pred = qf1_a_values.detach().cpu().numpy()
-                    y_true = next_q_value.detach().cpu().numpy()
-                    var_y = np.var(y_true)
-                    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-                    log_dict.update({
-                        "losses/actor_loss": actor_loss.item(),
-                        "losses/qf1_loss": qf1_loss.item(),
-                        "losses/qf2_loss": qf2_loss.item(),
-                        "losses/qf_loss": qf_loss.item(),
-                        "losses/explained_variance": explained_var,
-                    })
-
-                    # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-                    # TD3's actor is deterministic, so there's no learned std
-                    # parameter like PPO's actor_logstd; per-dim std here is
-                    # the empirical spread of the actor's outputs across the batch.
-                    actions_np = actor_actions.detach().cpu().numpy()
-                    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-                    action_dim_means = actions_flat.mean(axis=0)
-                    action_std_per_dim = actions_flat.std(axis=0)
-
-                    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-                    for dim_idx in range(actions_flat.shape[-1]):
-                        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
-
-                    # --- 4. ACTIONS: std (aggregate + per-dim) ---
-                    log_dict.update({
-                        "actions_std/aggregate": float(action_std_per_dim.mean()),
-                        "actions_std/min": float(action_std_per_dim.min()),
-                        "actions_std/max": float(action_std_per_dim.max()),
-                        "actions_std/frac_at_clip_bounds": float(
-                            np.mean(
-                                (actions_np <= env.action_space.low + 1e-3)
-                                | (actions_np >= env.action_space.high - 1e-3)
-                            )
-                        ),
-                    })
-                    for dim_idx, std_val in enumerate(action_std_per_dim):
-                        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
-
-                    # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
-                    obs_np = data.observations.detach().cpu().numpy()
-                    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-                    obs_dim_means = obs_flat.mean(axis=0)
-                    obs_dim_stds = obs_flat.std(axis=0)
-
-                    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-                    for dim_idx in range(obs_flat.shape[-1]):
-                        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-
-                    # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
-                    log_dict["observations_std/aggregate"] = float(obs_np.std())
-                    for dim_idx in range(obs_flat.shape[-1]):
-                        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
-
-                    # --- 7. SYSTEM (throughput + health diagnostics) ---
-                    obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-                    log_dict.update({
-                        "system/SPS": int(global_step / (time.time() - start_time)),
-                        "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-                    })
-
-                    # --- 8. CHARTS ---
-                    log_dict.update({
-                        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
-                        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
-                    })
-
-                    wandb.log(log_dict, step=global_step)
+                    log_td3_step(
+                        global_step, env, data,
+                        actor_actions, qf1_a_values, next_q_value,
+                        actor_loss, qf1_loss, qf2_loss, qf_loss,
+                        actor_optimizer, q_optimizer, device
+                    )
 
             # ----------------------------------------------------------
             # Async checkpoint (threaded, deep-copy before dispatch)
@@ -367,7 +327,135 @@ def train(cfg, env, path):
 
 
 # ==============================================================================
-# Entry point
+# Logging subroutine
+# ==============================================================================
+
+def log_td3_step(
+    global_step,
+    env,
+    data,
+    actor_actions,
+    qf1_a_values,
+    next_q_value,
+    actor_loss,
+    qf1_loss,
+    qf2_loss,
+    qf_loss,
+    actor_optimizer,
+    q_optimizer,
+    device,
+
+):
+    log_dict = {}
+
+    # --- 1. REWARDS ---
+    log_dict["rewards/mean"] = data.rewards.mean().item()
+
+    # --- 2. LOSSES & OPTIMIZATION ---
+    y_pred = qf1_a_values.detach().cpu().numpy()
+    y_true = next_q_value.detach().cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+    log_dict.update({
+        "losses/actor_loss": actor_loss.item(),
+        "losses/qf1_loss": qf1_loss.item(),
+        "losses/qf2_loss": qf2_loss.item(),
+        "losses/qf_loss": qf_loss.item(),
+        "losses/explained_variance": explained_var,
+    })
+
+    # --- 3 & 4. ACTIONS ---
+    actions_np = actor_actions.detach().cpu().numpy()
+    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+    action_dim_means = actions_flat.mean(axis=0)
+    action_std_per_dim = actions_flat.std(axis=0)
+
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    for dim_idx in range(actions_flat.shape[-1]):
+        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+
+    log_dict.update({
+        "actions_std/aggregate": float(action_std_per_dim.mean()),
+        "actions_std/min": float(action_std_per_dim.min()),
+        "actions_std/max": float(action_std_per_dim.max()),
+        "actions_std/frac_at_clip_bounds": float(
+            np.mean(
+                (actions_np <= env.action_space.low + 1e-3)
+                | (actions_np >= env.action_space.high - 1e-3)
+            )
+        ),
+    })
+    for dim_idx, std_val in enumerate(action_std_per_dim):
+        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
+
+    # --- 5 & 6. OBSERVATIONS ---
+    obs_np = data.observations.detach().cpu().numpy()
+    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
+
+    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+    log_dict["observations_std/aggregate"] = float(obs_np.std())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+
+
+    # --- 7b. CPU (separate panel group) ---
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(1 for c in per_core if c > 20.0),
+        "cpu/num_cores": len(per_core),
+    })
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # --- 7c. RAM (separate panel group) ---
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass  # io_counters not available on macOS
+
+    # --- 7d. GPU (separate panel group) ---
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass  # pynvml not available on this driver setup
+
+    # --- 8. CHARTS ---
+    log_dict.update({
+        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
+        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
+    })
+
+    wandb.log(log_dict, step=global_step)
+
+# ==============================================================================
+# Checkpointing
 # ==============================================================================
 
 def save_checkpoint(
@@ -418,16 +506,21 @@ def save_checkpoint(
     print(f"[model checkpoint] saved -> {model_path}")
 
 
+# ==============================================================================
+# Entry point
+# ==============================================================================
+
 @hydra.main(
     version_base=None,
     config_path="configs",
     config_name="config",
 )
-
-
-
 def main(cfg: DictConfig):
-    train(cfg)
+
+    raise NotImplementedError(
+        "main() must construct `env` and `path` before calling train(cfg, env, path). "
+        "See how your other algorithm entry points (PPO, SAC, etc.) do this."
+    )
 
 
 if __name__ == "__main__":

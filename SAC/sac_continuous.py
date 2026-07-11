@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import psutil
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
@@ -18,6 +19,14 @@ from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
 from RLfoundry.SAC.SACNetwork import Actor, SoftQNetwork
 
 from RLfoundry.Utils.run_startup import run_startup
+
+
+# ==============================================================================
+# Module-level state for CPU/RAM monitoring
+# ==============================================================================
+
+_proc = psutil.Process()
+_proc.cpu_percent()  # warm-up call — first real reading needs a prior baseline
 
 
 # ==============================================================================
@@ -36,9 +45,9 @@ def train(cfg, env, path):
         project=cfg.wandb_project_name,
         entity=cfg.wandb_entity,
         config=OmegaConf.to_container(cfg, resolve=True),
-        name=os.path.basename(path),
+        name=cfg.algo_name,
         group=cfg.env_id,
-        job_type=getattr(cfg, "algo_name", "sac"),
+        job_type=getattr(cfg, "algo_name", "ppo"),
         mode="offline" if cfg.get("wandb_offline", False) else "online",
     )
 
@@ -229,6 +238,14 @@ def train(cfg, env, path):
                     actor_loss.backward()
                     actor_optimizer.step()
 
+                    # BUG FIX: alpha_loss must exist even when cfg.autotune is
+                    # False, since log_sac_step is always called below and
+                    # always expects an alpha_loss argument (it only calls
+                    # .item() on it when autotune=True, but the Python name
+                    # itself has to exist first or you get a NameError before
+                    # the function is even entered).
+                    alpha_loss = None
+
                     if cfg.autotune:
                         with torch.no_grad():
                             _, log_pi, _ = actor.get_action(data.observations)
@@ -245,83 +262,19 @@ def train(cfg, env, path):
                 actor_loss_history.append(actor_loss.item())
 
                 if cfg.track:
-                    log_dict = {}
-
-                    # --- 1. REWARDS ---
-                    log_dict["rewards/mean"] = data.rewards.mean().item()
-
-                    # --- 2. LOSSES & OPTIMIZATION ---
-                    y_pred = qf1_a_values.detach().cpu().numpy()
-                    y_true = next_q_value.detach().cpu().numpy()
-                    var_y = np.var(y_true)
-                    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-                    log_dict.update({
-                        "losses/actor_loss": actor_loss.item(),
-                        "losses/qf1_loss": qf1_loss.item(),
-                        "losses/qf2_loss": qf2_loss.item(),
-                        "losses/qf_loss": qf_loss.item(),
-                        "losses/alpha": alpha,
-                        "losses/entropy": (-log_pi).mean().item(),
-                        "losses/explained_variance": explained_var,
-                    })
-                    if cfg.autotune:
-                        log_dict["losses/alpha_loss"] = alpha_loss.item()
-
-                    # --- 3. ACTIONS: mean (aggregate + per-dim) ---
-                    actions_np = pi.detach().cpu().numpy()
-                    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
-                    action_dim_means = actions_flat.mean(axis=0)
-                    action_std_per_dim = actions_flat.std(axis=0)
-
-                    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-                    for dim_idx in range(actions_flat.shape[-1]):
-                        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
-
-                    # --- 4. ACTIONS: std (aggregate + per-dim) ---
-                    log_dict.update({
-                        "actions_std/aggregate": float(action_std_per_dim.mean()),
-                        "actions_std/min": float(action_std_per_dim.min()),
-                        "actions_std/max": float(action_std_per_dim.max()),
-                        "actions_std/frac_at_clip_bounds": float(
-                            np.mean(
-                                (actions_np <= env.action_space.low + 1e-3)
-                                | (actions_np >= env.action_space.high - 1e-3)
-                            )
-                        ),
-                    })
-                    for dim_idx, std_val in enumerate(action_std_per_dim):
-                        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
-
-                    # --- 5. OBSERVATIONS: mean (aggregate + per-dim) ---
-                    obs_np = data.observations.detach().cpu().numpy()
-                    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-                    obs_dim_means = obs_flat.mean(axis=0)
-                    obs_dim_stds = obs_flat.std(axis=0)
-
-                    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-                    for dim_idx in range(obs_flat.shape[-1]):
-                        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-
-                    # --- 6. OBSERVATIONS: std (aggregate + per-dim) ---
-                    log_dict["observations_std/aggregate"] = float(obs_np.std())
-                    for dim_idx in range(obs_flat.shape[-1]):
-                        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
-
-                    # --- 7. SYSTEM (throughput + health diagnostics) ---
-                    obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-                    log_dict.update({
-                        "system/SPS": int(global_step / (time.time() - start_time)),
-                        "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-                    })
-
-                    # --- 8. CHARTS ---
-                    log_dict.update({
-                        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
-                        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
-                    })
-
-                    wandb.log(log_dict, step=global_step)
+                    # BUG FIX (was two bugs):
+                    #   1. `autotune` doesn't exist as a bare name in train() —
+                    #      only cfg.autotune does. Pass cfg.autotune instead.
+                    #   2. `device` was missing entirely — log_sac_step needs
+                    #      it for the GPU block and the call would raise
+                    #      TypeError (missing positional arg) without it.
+                    log_sac_step(
+                        global_step, env, data, pi,
+                        qf1_a_values, next_q_value,
+                        actor_loss, qf1_loss, qf2_loss, qf_loss,
+                        alpha, log_pi, cfg.autotune, alpha_loss,
+                        actor_optimizer, q_optimizer, device,
+                    )
 
             # ----------------------------------------------------------
             # Target network Polyak update
@@ -440,13 +393,138 @@ def save_checkpoint(
     print(f"[model checkpoint] saved -> {model_path}")
 
 
+# ==============================================================================
+# Logging subroutine
+# ==============================================================================
+
+def log_sac_step(
+    global_step, env, data, pi,
+    qf1_a_values, next_q_value,
+    actor_loss, qf1_loss, qf2_loss, qf_loss,
+    alpha, log_pi, autotune, alpha_loss,
+    actor_optimizer, q_optimizer, device
+):
+    log_dict = {}
+
+    log_dict["rewards/mean"] = data.rewards.mean().item()
+
+    y_pred = qf1_a_values.detach().cpu().numpy()
+    y_true = next_q_value.detach().cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+    log_dict.update({
+        "losses/actor_loss": actor_loss.item(),
+        "losses/qf1_loss": qf1_loss.item(),
+        "losses/qf2_loss": qf2_loss.item(),
+        "losses/qf_loss": qf_loss.item(),
+        "losses/alpha": alpha,
+        "losses/entropy": (-log_pi).mean().item(),
+        "losses/explained_variance": explained_var,
+    })
+    # BUG FIX: alpha_loss is None when cfg.autotune is False (see train()) —
+    # guard on autotune AND alpha_loss not being None before calling .item(),
+    # otherwise this throws AttributeError: 'NoneType' object has no attribute 'item'
+    if autotune and alpha_loss is not None:
+        log_dict["losses/alpha_loss"] = alpha_loss.item()
+
+    actions_np = pi.detach().cpu().numpy()
+    actions_flat = actions_np.reshape(actions_np.shape[0], -1)
+    action_dim_means = actions_flat.mean(axis=0)
+    action_std_per_dim = actions_flat.std(axis=0)
+
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    for dim_idx in range(actions_flat.shape[-1]):
+        log_dict[f"actions_mean/dim{dim_idx}"] = float(action_dim_means[dim_idx])
+
+    log_dict.update({
+        "actions_std/aggregate": float(action_std_per_dim.mean()),
+        "actions_std/min": float(action_std_per_dim.min()),
+        "actions_std/max": float(action_std_per_dim.max()),
+        "actions_std/frac_at_clip_bounds": float(
+            np.mean(
+                (actions_np <= env.action_space.low + 1e-3)
+                | (actions_np >= env.action_space.high - 1e-3)
+            )
+        ),
+    })
+    for dim_idx, std_val in enumerate(action_std_per_dim):
+        log_dict[f"actions_std/dim{dim_idx}"] = float(std_val)
+
+    obs_np = data.observations.detach().cpu().numpy()
+    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
+
+    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+    log_dict["observations_std/aggregate"] = float(obs_np.std())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+    log_dict.update({
+        "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
+        "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
+    })
+
+    # --- CPU (separate panel group) ---
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(1 for c in per_core if c > 20.0),
+        "cpu/num_cores": len(per_core),
+    })
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # --- RAM (separate panel group) ---
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass  # io_counters not available on macOS
+
+    # --- GPU (separate panel group) ---
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass  # pynvml not available on this driver setup
+
+    wandb.log(log_dict, step=global_step)
+
+
 @hydra.main(
     version_base=None,
     config_path="configs",
     config_name="config",
 )
 def main(cfg: DictConfig):
-    train(cfg)
+    # NOTE: same pre-existing gap as TD3 — train() needs (cfg, env, path),
+    # main() only has cfg. Needs env construction + path wired in from
+    # wherever your other entry points build these.
+    raise NotImplementedError(
+        "main() must construct `env` and `path` before calling train(cfg, env, path)."
+    )
 
 
 if __name__ == "__main__":
