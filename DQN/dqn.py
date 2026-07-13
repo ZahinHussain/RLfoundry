@@ -1,18 +1,29 @@
+
+
 import os
 import random
 import time
 
 import numpy as np
+import psutil
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from omegaconf import OmegaConf
 
-from RLfoundry.DQN.distributed import C51Distribution
-from RLfoundry.DQN.network import C51NoisyDuelingCNN, C51NoisyDuelingMLP
-from RLfoundry.DQN.replay_buffer import NStepPrioritizedReplayBuffer
+from RLfoundry.DQN.network import Network
+from RLfoundry.DQN.replay_buffer import ReplayBuffer
 
 from RLfoundry.Utils.run_startup import run_startup
+
+_proc = psutil.Process()
+_proc.cpu_percent()
+
+
+def linear_schedule(start_e: float, end_e: float, duration: int, t: int) -> float:
+    slope = (end_e - start_e) / duration
+    return max(slope * t + start_e, end_e)
 
 
 def train(cfg, env, path):
@@ -44,37 +55,15 @@ def train(cfg, env, path):
 
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
 
-    is_atari = "ALE/" in cfg.env_id or "NoFrameskip" in cfg.env_id
-
     # ------------------------------------------------------------------
-    # C51 distribution + networks (NoisyNet -> no epsilon schedule)
+    # Networks (plain Q-network, no dueling/noisy/distributional head)
     # ------------------------------------------------------------------
     obs_shape = env.observation_space.shape
     num_actions = env.action_space.n
+    obs_dim = obs_shape[0]
 
-    c51 = C51Distribution(
-        v_min=cfg.v_min,
-        v_max=cfg.v_max,
-        atom_size=cfg.atom_size,
-        device=device,
-    )
-    atom_size = c51.atom_size
-
-    if is_atari:
-        policy_net = C51NoisyDuelingCNN(
-            num_actions=num_actions, atom_size=atom_size, support=c51.support
-        ).to(device)
-        target_net = C51NoisyDuelingCNN(
-            num_actions=num_actions, atom_size=atom_size, support=c51.support
-        ).to(device)
-    else:
-        obs_dim = obs_shape[0]
-        policy_net = C51NoisyDuelingMLP(
-            obs_dim=obs_dim, num_actions=num_actions, atom_size=atom_size, support=c51.support
-        ).to(device)
-        target_net = C51NoisyDuelingMLP(
-            obs_dim=obs_dim, num_actions=num_actions, atom_size=atom_size, support=c51.support
-        ).to(device)
+    policy_net = Network(in_dim=obs_dim, out_dim=num_actions).to(device)
+    target_net = Network(in_dim=obs_dim, out_dim=num_actions).to(device)
 
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
@@ -82,13 +71,12 @@ def train(cfg, env, path):
     optimizer = optim.Adam(policy_net.parameters(), lr=cfg.lr)
 
     # ------------------------------------------------------------------
-    # N-step prioritized replay buffer
+    # Plain uniform replay buffer (no PER, no N-step)
     # ------------------------------------------------------------------
-    rb = NStepPrioritizedReplayBuffer(
-        capacity=cfg.buffer_size,
-        obs_shape=obs_shape,
-        n_step=cfg.n_step,
-        gamma=cfg.gamma,
+    rb = ReplayBuffer(
+        obs_dim=obs_shape[0],
+        size=cfg.buffer_size,
+        batch_size=cfg.batch_size,
     )
 
     # ------------------------------------------------------------------
@@ -109,15 +97,19 @@ def train(cfg, env, path):
     for global_step in range(cfg.total_timesteps):
 
         # --------------------------------------------------------------
-        # Action selection — NoisyNet handles exploration, always greedy
-        # w.r.t. the (noisy) expectation of the categorical distribution.
+        # Epsilon-greedy action selection
         # --------------------------------------------------------------
-        policy_net.reset_noise()
-        with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            dist = policy_net(obs_t)
-            q_vals = c51.expectation(dist)
-            action = q_vals.argmax(1).item()
+        epsilon = linear_schedule(
+            cfg.start_e, cfg.end_e, cfg.exploration_fraction * cfg.total_timesteps, global_step
+        )
+
+        if random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                q_vals = policy_net(obs_t)
+                action = q_vals.argmax(1).item()
 
         # --------------------------------------------------------------
         # Step environment
@@ -136,6 +128,7 @@ def train(cfg, env, path):
                 wandb.log({
                     "charts/episodic_return": ep_return,
                     "charts/episodic_length": ep_length,
+                    "charts/epsilon": epsilon,
                 }, step=global_step)
 
         rb.store(obs, action, reward, next_obs, done)
@@ -151,43 +144,35 @@ def train(cfg, env, path):
         # ==============================================================
         if global_step > cfg.learning_starts and len(rb) >= cfg.batch_size:
 
-            (states, actions, rewards, next_states, dones, gammas, idxs, weights) = rb.sample(cfg.batch_size)
+
+
+            states, actions, rewards, next_states, dones = rb.sample_batch(cfg.batch_size)
+
+
 
             states      = torch.tensor(states, dtype=torch.float32, device=device)
             actions_t   = torch.tensor(actions, dtype=torch.int64, device=device).unsqueeze(1)
             rewards_t   = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
             next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
-            dones_t     = torch.tensor(dones, dtype=torch.bool, device=device).unsqueeze(1)
-            gammas_t    = torch.tensor(gammas, dtype=torch.float32, device=device).unsqueeze(1)
-            weights_t   = torch.tensor(weights, dtype=torch.float32, device=device).unsqueeze(1)
+            dones_t     = torch.tensor(dones, dtype=torch.float32, device=device).unsqueeze(1)
 
-            policy_net.reset_noise()
-            target_net.reset_noise()
-
-            dist = policy_net(states)
-            dist_a = dist[range(states.size(0)), actions_t.squeeze()]
-
-            # Double DQN: action selection via policy net, evaluation via target net
+            # Standard 1-step Bellman target (no double-Q, no distributional)
             with torch.no_grad():
-                next_dist_policy = policy_net(next_states)
-                next_q = c51.expectation(next_dist_policy)
-                next_actions = next_q.argmax(dim=1)
+                next_q = target_net(next_states)
+                next_q_max, _ = next_q.max(dim=1, keepdim=True)
+                target = rewards_t + cfg.gamma * (1.0 - dones_t) * next_q_max
 
-                next_dist_target = target_net(next_states)
-                next_dist_a = next_dist_target[range(states.size(0)), next_actions]
+            q_all = policy_net(states)
+            q_sa = q_all.gather(1, actions_t)
 
-                target_dist = c51.project(next_dist_a, rewards_t, dones_t, gammas_t)
-
-            loss_elem = -(target_dist * (dist_a + 1e-8).log()).sum(dim=1)
-            loss = (loss_elem * weights_t.squeeze()).mean()
+            loss = F.smooth_l1_loss(q_sa, target)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy_net.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
-            td = loss_elem.detach().cpu().numpy()
-            rb.update_priorities(idxs, td)
+            td = (target - q_sa).detach().abs().cpu().numpy()
 
             loss_history.append(loss.item())
             learn_steps += 1
@@ -208,50 +193,12 @@ def train(cfg, env, path):
             # ----------------------------------------------------------
             # wandb logging — 8 panel groups
             # ----------------------------------------------------------
-            # ----------------------------------------------------------
-            # wandb logging — 8 panel groups, logs every learn step
-            # ----------------------------------------------------------
+
             if cfg.track:
-                log_dict = {}
-
-                log_dict["rewards/mean"] = float(rewards_t.mean().item())
-
-                log_dict.update({
-                    "losses/c51_loss": loss.item(),
-                    "losses/td_error_mean": float(td.mean()),
-                    "losses/td_error_max": float(td.max()),
-                })
-
-                actions_np = actions_t.detach().cpu().numpy().flatten()
-                log_dict["actions_mean/aggregate"] = float(actions_np.mean())
-                log_dict["actions_std/aggregate"] = float(actions_np.std())
-                for a_idx in range(num_actions):
-                    log_dict[f"actions_mean/action_{a_idx}_frac"] = float(np.mean(actions_np == a_idx))
-
-                obs_np = states.detach().cpu().numpy()
-                obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-                obs_dim_means = obs_flat.mean(axis=0)
-                obs_dim_stds = obs_flat.std(axis=0)
-
-                log_dict["observations_mean/aggregate"] = float(obs_flat.mean())
-                log_dict["observations_std/aggregate"] = float(obs_flat.std())
-                for dim_idx in range(obs_flat.shape[-1]):
-                    log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-                    log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
-
-                obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-                log_dict.update({
-                    "system/SPS": int(global_step / (time.time() - start_time)),
-                    "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-                    "system/buffer_size": len(rb),
-                    "system/per_beta": float(getattr(rb, "beta", np.nan)),
-                })
-
-                log_dict.update({
-                    "charts/learning_rate": optimizer.param_groups[0]["lr"],
-                })
-
-                wandb.log(log_dict, step=global_step)
+                log_dqn_step(
+                    global_step, num_actions, rewards_t, loss, td,
+                    actions_t, states, epsilon, rb, optimizer, device,
+                )
 
         # ----------------------------------------------------------------
         # Async checkpoint (periodic, based on wall-clock interval)
@@ -287,6 +234,98 @@ def train(cfg, env, path):
 
     env.close()
     wandb.finish()
+
+def log_dqn_step(
+    global_step, num_actions, rewards_t, loss, td,
+    actions_t, states, epsilon, rb, optimizer, device,
+):
+    log_dict = {}
+
+    # --- 1. REWARDS ---
+    log_dict["rewards/mean"] = float(rewards_t.mean().item())
+
+    # --- 2. LOSSES ---
+    log_dict.update({
+        "losses/dqn_loss": loss.item(),
+        "losses/td_error_mean": float(td.mean()),
+        "losses/td_error_max": float(td.max()),
+    })
+
+    # --- 3/4. ACTIONS: mean + std (discrete -> action-frequency style) ---
+    actions_np = actions_t.detach().cpu().numpy().flatten()
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    log_dict["actions_std/aggregate"] = float(actions_np.std())
+    for a_idx in range(num_actions):
+        log_dict[f"actions_mean/action_{a_idx}_frac"] = float(np.mean(actions_np == a_idx))
+
+    # --- 5/6. OBSERVATIONS: mean + std (aggregate + per-dim) ---
+    obs_np = states.detach().cpu().numpy()
+    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
+
+    log_dict["observations_mean/aggregate"] = float(obs_flat.mean())
+    log_dict["observations_std/aggregate"] = float(obs_flat.std())
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+    # --- 8. CHARTS ---
+    log_dict.update({
+        "charts/learning_rate": optimizer.param_groups[0]["lr"],
+        "charts/epsilon": epsilon,
+        "charts/buffer_size": len(rb),
+    })
+
+    # --- 8. CHARTS ---
+    log_dict.update({
+        "charts/learning_rate": optimizer.param_groups[0]["lr"],
+    })
+
+    # --- CPU (separate panel group) ---
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(1 for c in per_core if c > 20.0),
+        "cpu/num_cores": len(per_core),
+    })
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # --- RAM (separate panel group) ---
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass  # io_counters not available on macOS
+
+    # --- GPU (separate panel group) ---
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass  # pynvml not available on this driver setup
+
+
+
+    wandb.log(log_dict, step=global_step)
 
 
 def save_checkpoint(save_dir, global_step, policy_net, target_net, optimizer, **arrays):

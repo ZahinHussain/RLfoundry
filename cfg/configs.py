@@ -206,6 +206,8 @@ class DQNConfig:
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
     capture_video: bool = False
+    lr:float = 0.0000625
+    max_grad_norm: float = 0.5
 
     num_envs: int = 1
     total_timesteps: int = 1_024_000
@@ -226,6 +228,11 @@ class DQNConfig:
 
     interval_save: int = 30
 
+    # Target network update
+    target_update_type: str = "hard"  # "hard" or "soft"
+    target_update_freq: int = 1000  # used if "hard"
+    tau: float = 0.005  # used if "soft"
+
 # ============================================================================
 # Loader — this is the part that plugs into your existing code
 # ============================================================================
@@ -236,6 +243,7 @@ _CONFIGS = {
     "sac": SACConfig,
     "td3": TD3Config,
     "dqn": DQNConfig,
+"   rdqn": DQNConfig,
 
 }
 

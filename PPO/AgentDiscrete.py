@@ -14,11 +14,8 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, env):
         super().__init__()
-        obs_dim = env.observation_space.shape[0]  # e.g. 4 for CartPole
-
-
-        act_dim = env.action_space[0].n
-
+        obs_dim = env.observation_space.shape[0]  # 8 for LunarLander
+        act_dim = env.action_space.n  # 4 for LunarLander
 
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),

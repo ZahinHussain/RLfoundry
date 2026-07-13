@@ -83,7 +83,7 @@ def train(cfg, env, path):
             # DISCRETE CHANGE: No clipping needed. Just extract the integer action.
             action_np = action.item()
 
-            next_obs_np, reward, terminations, truncations, info = env.step((action_np,))
+            next_obs_np, reward, terminations, truncations, info = env.step(action_np)
 
 
             current_ep_return += float(reward)

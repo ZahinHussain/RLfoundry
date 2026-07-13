@@ -1,3 +1,3 @@
-from .dqn import train
+from .rainbowdqn import train
 
 __all__ = ["train"]

@@ -231,14 +231,14 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-    def sample_batch(self):
-        idxs = np.random.choice(self.size, self.batch_size, replace=False)
-        return dict(
-            obs=self.obs_buf[idxs],
-            next_obs=self.next_obs_buf[idxs],
-            acts=self.acts_buf[idxs],
-            rews=self.rews_buf[idxs],
-            done=self.done_buf[idxs],
+    def sample_batch(self,batch_size):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        return (
+            self.obs_buf[idxs],
+            self.acts_buf[idxs],
+            self.rews_buf[idxs],
+            self.next_obs_buf[idxs],
+            self.done_buf[idxs],
         )
 
     def __len__(self):
