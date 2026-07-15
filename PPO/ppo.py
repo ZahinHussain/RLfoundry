@@ -81,21 +81,17 @@ def train(cfg, env, path):
             logprobs[step] = logprob
 
             # DISCRETE CHANGE: No clipping needed. Just extract the integer action.
-            action_np = action.item()
+            next_obs_np, reward, terminations, truncations, info = env.step(action)
+            done = np.logical_or(terminations, truncations)
 
-            next_obs_np, reward, terminations, truncations, info = env.step(action_np)
-
-
+            if done:
+                next_obs_np, info = env.reset()
             current_ep_return += float(reward)
             current_ep_length += 1
-
-            if next_done:
+            if done:
                 if getattr(cfg, "debug_episode_prints", False):
                     print(
                         f"[episode end] global_step={global_step} return={current_ep_return:.2f} length={current_ep_length}")
-
-                next_obs_np, info = env.reset()
-
                 if cfg.track:
                     ep_return = info["episode"]["r"] if "episode" in info else current_ep_return
                     ep_length = info["episode"]["l"] if "episode" in info else current_ep_length
@@ -103,12 +99,10 @@ def train(cfg, env, path):
                         "charts/episodic_return": ep_return,
                         "charts/episodic_length": ep_length,
                     }, step=global_step)
-
                 current_ep_return = 0.0
                 current_ep_length = 0
-
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(next_done, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(float(done), dtype=torch.float32, device=device)
 
         # GAE Calculation (Remains exactly the same)
         with torch.no_grad():

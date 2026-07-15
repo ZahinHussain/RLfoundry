@@ -107,7 +107,7 @@ def train(cfg, env, path):
     # Main loop
     # ==================================================================
     obs, _ = env.reset(seed=cfg.seed)
-    obs = np.array(obs, dtype=np.float32, copy=False)
+    obs = np.array(obs, dtype=np.float32)
 
     for global_step in range(cfg.total_timesteps):
 
@@ -126,7 +126,7 @@ def train(cfg, env, path):
         # Step environment
         # --------------------------------------------------------------
         next_obs, reward, terminated, truncated, infos = env.step(action)
-        next_obs = np.array(next_obs, dtype=np.float32, copy=False)
+        next_obs = np.array(next_obs, dtype=np.float32)
         done = terminated or truncated
 
         if "episode" in infos:
@@ -145,7 +145,7 @@ def train(cfg, env, path):
 
         if done:
             obs, _ = env.reset()
-            obs = np.array(obs, dtype=np.float32, copy=False)
+            obs = np.array(obs, dtype=np.float32)
         else:
             obs = next_obs
 

@@ -233,6 +233,53 @@ class DQNConfig:
     target_update_freq: int = 1000  # used if "hard"
     tau: float = 0.005  # used if "soft"
 
+
+@dataclass
+class RDQNConfig:
+    # --- run identity ---
+    exp_name: str = "dqn"
+    algo_name: str = "dqn"
+    env_id: str = "default"           # set per-environment at load time
+    gym_id: str = "default"           # legacy field, kept for compatibility
+    seed: int = 67
+    torch_deterministic: bool = True
+    cuda: bool = True
+
+    # --- tracking ---
+    track: bool = True
+    wandb_project_name: str = "default"
+    wandb_entity: Optional[str] = None
+    wandb_offline: bool = False
+    capture_video: bool = False
+
+    # --- optimization ---
+    lr: float = 0.0000625
+    max_grad_norm: float = 0.5
+    num_envs: int = 1
+    total_timesteps: int = 1_024_000
+    batch_size: int = 128
+    gamma: float = 0.99
+
+    # --- replay buffer ---
+    buffer_size: int = 1_000_000
+    learning_starts: int = 10_000
+    train_frequency: int = 4
+    n_step: int = 3                   # n-step returns for NStepPrioritizedReplayBuffer
+
+    # --- C51 distributional RL ---
+    v_min: float = -10.0
+    v_max: float = 10.0
+    atom_size: int = 51
+
+    # --- checkpointing ---
+    interval_save: int = 30           # minutes between async numpy/model saves
+
+    # --- target network update ---
+    target_update_type: str = "hard"  # "hard" or "soft"
+    target_update_freq: int = 1000    # used if "hard"
+    tau: float = 0.005                # used if "soft"
+
+
 # ============================================================================
 # Loader — this is the part that plugs into your existing code
 # ============================================================================
@@ -243,7 +290,7 @@ _CONFIGS = {
     "sac": SACConfig,
     "td3": TD3Config,
     "dqn": DQNConfig,
-"   rdqn": DQNConfig,
+    "rdqn": RDQNConfig,
 
 }
 
