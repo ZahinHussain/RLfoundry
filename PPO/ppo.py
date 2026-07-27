@@ -7,6 +7,7 @@ import threading
 import hydra
 import gymnasium as gym
 import numpy as np
+import psutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,7 +19,8 @@ from RLfoundry.PPO.AgentDiscrete import Agent  # Ensure this is updated to Categ
 from RLfoundry.Utils.run_startup import run_startup
 from RLfoundry.Utils.checkpoint import create_folder_checkpoint, create_timestamp_folder
 
-
+_proc = psutil.Process()
+_proc.cpu_percent()  # w
 def train(cfg, env, path):
     path = run_startup(path, cfg)
 
@@ -182,91 +184,198 @@ def train(cfg, env, path):
         sps = int(global_step / (time.time() - start_time))
         print("SPS:", sps)
 
+        # ====================================================================
         # LOGGING TO WANDB
-        log_dict = {}
-        log_dict["rewards/mean"] = rewards.mean().item()
+        # BUG FIX: this block previously ran unconditionally with no
+        # `cfg.track` guard, unlike every other algorithm file. Wrapped to
+        # match convention — if cfg.track=False, wandb.log should never be
+        # called at all.
+        # ====================================================================
+        if cfg.track:
+            log_ppo_step(
+                global_step, env, rewards,
+                b_values, b_returns, pg_loss, v_loss, entropy_loss,
+                old_approx_kl, approx_kl, b_actions, obs,
+                optimizer, device, sps, grad_norm,
+            )
 
-        y_pred = b_values.cpu().numpy()
-        y_true = b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = float("nan") if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        log_dict.update({
-            "losses/policy_loss": pg_loss.item(),
-            "losses/value_loss": v_loss.item(),
-            "losses/entropy": entropy_loss.item(),
-            "losses/old_approx_kl": old_approx_kl.item(),
-            "losses/approx_kl": approx_kl.item(),
-            "losses/explained_variance": explained_var,
-        })
-
-        # DISCRETE CHANGE: Log action probabilities instead of continuous mean/std
-        actions_np = actions.detach().cpu().numpy()
-        action_counts = np.bincount(actions_np, minlength=env.action_space.n)
-        action_probs = action_counts / max(action_counts.sum(), 1)
-
-        for dim_idx, prob in enumerate(action_probs):
-            log_dict[f"actions/prob_dim{dim_idx}"] = float(prob)
-
-        # Observation logging (Remains the same)
-        obs_np = obs.detach().cpu().numpy()
-        obs_flat = obs_np.reshape(obs_np.shape[0], -1)
-        obs_dim_means = obs_flat.mean(axis=0)
-        obs_dim_stds = obs_flat.std(axis=0)
-
-        log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
-        log_dict["observations_std/aggregate"] = float(obs_np.std())
-        for dim_idx in range(obs_flat.shape[-1]):
-            log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
-
-        obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
-        log_dict.update({
-            "system/SPS": sps,
-            "system/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm),
-            "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
-        })
-
-        wandb.log(log_dict, step=global_step)
-
-        # CHECKPOINTING (Removed continuous action stats to prevent KeyErrors)
+        # ====================================================================
+        # CHECKPOINTING
+        # ====================================================================
         now = time.time()
         if now - last_numpy_save_t >= SAVE_INTERVAL_SECONDS:
             save_checkpoint(
-                path, global_step, agent, optimizer, block=True,
-                obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
-                logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
-                dones=dones.cpu().numpy(), values=values.cpu().numpy(),
-                returns=returns.cpu().numpy(), advantages=advantages.cpu().numpy(),
-                rewards_mean=np.array(log_dict["rewards/mean"]),
-                policy_loss=np.array(log_dict["losses/policy_loss"]),
-                value_loss=np.array(log_dict["losses/value_loss"]),
-                entropy=np.array(log_dict["losses/entropy"]),
-                old_approx_kl=np.array(log_dict["losses/old_approx_kl"]),
-                approx_kl=np.array(log_dict["losses/approx_kl"]),
-                explained_variance=np.array(log_dict["losses/explained_variance"]),
-                SPS=np.array(log_dict["system/SPS"]),
-                grad_norm=np.array(log_dict["system/grad_norm"]),
-                obs_has_nan_or_inf=np.array(log_dict["system/obs_has_nan_or_inf"]),
-                learning_rate=np.array(log_dict["charts/learning_rate"]),
-                global_step_np=np.array(global_step),
+                path,
+                global_step,
+                agent,
+                optimizer,
             )
             last_numpy_save_t = now
 
-    # Final save
+        # Final save
     save_checkpoint(
-        path, global_step, agent, optimizer, block=True,
-        obs=obs.cpu().numpy(), actions=actions.cpu().numpy(),
-        logprobs=logprobs.cpu().numpy(), rewards=rewards.cpu().numpy(),
-        dones=dones.cpu().numpy(), values=values.cpu().numpy(),
-        returns=returns.cpu().numpy(), test=pg_loss.item()
+        path,
+        global_step,
+        agent,
+        optimizer,
     )
 
     wandb.finish()
+
     env.close()
 
+
+# ==============================================================================
+# Logging subroutine
+# ==============================================================================
+
+def log_ppo_step(
+    global_step,
+    env,
+    rewards,
+    b_values,
+    b_returns,
+    pg_loss,
+    v_loss,
+    entropy_loss,
+    old_approx_kl,
+    approx_kl,
+    actions,
+    obs,
+    optimizer,
+    device,
+    sps,
+    grad_norm,
+):
+    log_dict = {}
+
+    # ------------------------------------------------------------------
+    # 1. REWARDS
+    # ------------------------------------------------------------------
+    log_dict["rewards/mean"] = rewards.mean().item()
+
+    # ------------------------------------------------------------------
+    # 2. LOSSES
+    # ------------------------------------------------------------------
+    y_pred = b_values.detach().cpu().numpy()
+    y_true = b_returns.detach().cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = (
+        float("nan")
+        if var_y == 0
+        else 1 - np.var(y_true - y_pred) / var_y
+    )
+
+    log_dict.update({
+        "losses/policy_loss": pg_loss.item(),
+        "losses/value_loss": v_loss.item(),
+        "losses/entropy": entropy_loss.item(),
+        "losses/old_approx_kl": old_approx_kl.item(),
+        "losses/approx_kl": approx_kl.item(),
+        "losses/explained_variance": explained_var,
+    })
+
+    # ------------------------------------------------------------------
+    # 3. ACTIONS (Discrete)
+    # ------------------------------------------------------------------
+    actions_np = actions.detach().cpu().numpy().flatten().astype(np.int64)
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    log_dict["actions_std/aggregate"] = float(actions_np.std())
+
+    num_actions = env.action_space.n
+    action_counts = np.bincount(actions_np, minlength=num_actions)
+    action_probs = action_counts / max(action_counts.sum(), 1)
+
+    for a_idx in range(num_actions):
+        log_dict[f"actions_mean/action_{a_idx}_frac"] = float(action_probs[a_idx])
+
+    # ------------------------------------------------------------------
+    # 4. OBSERVATIONS
+    # ------------------------------------------------------------------
+    obs_np = obs.detach().cpu().numpy()
+    obs_flat = obs_np.reshape(obs_np.shape[0], -1)
+
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
+
+    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+    log_dict["observations_std/aggregate"] = float(obs_np.std())
+
+    for dim_idx in range(obs_flat.shape[-1]):
+        log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
+
+    obs_has_nan_or_inf = bool(
+        np.isnan(obs_np).any() or np.isinf(obs_np).any()
+    )
+
+    # ------------------------------------------------------------------
+    # 5. TRAINING
+    # ------------------------------------------------------------------
+    log_dict.update({
+        "system/SPS": sps,
+        "system/grad_norm": (
+            grad_norm.item()
+            if torch.is_tensor(grad_norm)
+            else float(grad_norm)
+        ),
+        "system/obs_has_nan_or_inf": int(obs_has_nan_or_inf),
+        "charts/learning_rate": optimizer.param_groups[0]["lr"],
+    })
+
+    # ------------------------------------------------------------------
+    # 6. CPU
+    # ------------------------------------------------------------------
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(c > 20.0 for c in per_core),
+        "cpu/num_cores": len(per_core),
+    })
+
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # ------------------------------------------------------------------
+    # 7. RAM
+    # ------------------------------------------------------------------
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass
+
+    # ------------------------------------------------------------------
+    # 8. GPU
+    # ------------------------------------------------------------------
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass
+
+    wandb.log(log_dict, step=global_step)
 
 
 def clone_optimizer_state(optimizer_state: dict) -> dict:
@@ -287,14 +396,6 @@ def write_checkpoint(step_dir, model_dir, global_step, agent_state, optimizer_st
         os.makedirs(model_dir, exist_ok=True)
 
         # --- rollout arrays (atomic write) ---
-        # Save numpy arrays
-        step_dir = os.path.join(step_dir, "numpy", f"step_{global_step}")
-        os.makedirs(step_dir, exist_ok=True)
-
-        for name, arr in arrays.items():
-            np.save(os.path.join(step_dir, f"{name}.npy"), arr)
-
-        print(f"[numpy checkpoint] saved {list(arrays.keys())} -> {step_dir}")
 
         # --- model + optimizer (atomic write) ---
         model_path = os.path.join(model_dir, f"ppo_step_{global_step}.pt")
@@ -333,7 +434,6 @@ def save_checkpoint(
     optimizer_state = clone_optimizer_state(optimizer.state_dict())
     arrays = {k: np.array(v, copy=True) for k, v in arrays.items()}
 
-
     model_dir = os.path.join(save_dir, "models")
 
     t = threading.Thread(
@@ -352,10 +452,13 @@ def save_checkpoint(
     config_name="config",
 )
 def main(cfg: DictConfig):
-    train(cfg)
+    # NOTE: same pre-existing gap as TD3/SAC — train() needs (cfg, env, path),
+    # main() only has cfg. Needs env construction + path wired in from
+    # wherever your other entry points build these.
+    raise NotImplementedError(
+        "main() must construct `env` and `path` before calling train(cfg, env, path)."
+    )
 
 
 if __name__ == "__main__":
     main()
-
-# ... (Keep your clone_optimizer_state, write_checkpoint, save_checkpoint, and hydra main functions exactly as they were) ...

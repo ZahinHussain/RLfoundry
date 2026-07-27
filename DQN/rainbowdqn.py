@@ -297,6 +297,48 @@ def log_c51_step(
         "charts/buffer_size": len(rb),
     })
 
+    # --- CPU (separate panel group) ---
+    per_core = psutil.cpu_percent(percpu=True)
+
+    log_dict.update({
+        "cpu/proc_cpu_percent": _proc.cpu_percent(),
+        "cpu/proc_num_threads": _proc.num_threads(),
+        "cpu/sys_cpu_percent": psutil.cpu_percent(),
+        "cpu/core_max_percent": max(per_core),
+        "cpu/core_mean_percent": sum(per_core) / len(per_core),
+        "cpu/cores_active_count": sum(1 for c in per_core if c > 20.0),
+        "cpu/num_cores": len(per_core),
+    })
+    for core_idx, core_pct in enumerate(per_core):
+        log_dict[f"cpu_percore/core{core_idx}"] = core_pct
+
+    # --- RAM (separate panel group) ---
+    log_dict.update({
+        "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
+        "ram/sys_percent": psutil.virtual_memory().percent,
+    })
+
+    try:
+        io = _proc.io_counters()
+        log_dict.update({
+            "ram/proc_read_bytes": io.read_bytes,
+            "ram/proc_write_bytes": io.write_bytes,
+        })
+    except (AttributeError, NotImplementedError):
+        pass  # io_counters not available on macOS
+
+    # --- GPU (separate panel group) ---
+    if device.type == "cuda":
+        log_dict.update({
+            "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+            "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+        })
+        try:
+            log_dict["gpu/utilization_percent"] = torch.cuda.utilization(device)
+        except Exception:
+            pass  # pynvml not available on this driver setup
+
+
     wandb.log(log_dict, step=global_step)
 
 

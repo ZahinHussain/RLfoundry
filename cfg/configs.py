@@ -15,6 +15,9 @@ from omegaconf import OmegaConf, DictConfig
 from hydra.core.config_store import ConfigStore
 
 
+
+seed = 44
+
 # ============================================================================
 # PPO
 # ============================================================================
@@ -26,7 +29,7 @@ class PPOConfig:
     env_id: str = "default"          # set per-environment at load time
 
     learning_rate: float = 3e-4
-    seed: int = 67
+    seed: int = seed
     gamma: float = 0.99
     total_timesteps: int = 1_024_000
     torch_deterministic: bool = True
@@ -67,7 +70,7 @@ class RPOConfig:
     env_id: str = "SustainGym-BuildingHvac-v0"
 
     learning_rate: float = 3e-4
-    seed: int = 67
+    seed: int = seed
     gamma: float = 0.99
     total_timesteps: int = 1_024_000
     torch_deterministic: bool = True
@@ -108,7 +111,7 @@ class SACConfig:
     algo_name: str = "sac"
     env_id: str = "default"
 
-    seed: int = 67
+    seed: int = seed
     torch_deterministic: bool = True
     cuda: bool = True
 
@@ -148,7 +151,7 @@ class SACConfig:
 class TD3Config:
     exp_name: str = "td3"
     algo_name: str = "td3"
-    seed: int = 67                    # was 1 in source — flagged as inconsistent, fix here if deliberate
+    seed: int = seed                    # was 1 in source — flagged as inconsistent, fix here if deliberate
     torch_deterministic: bool = True
     cuda: bool = True
 
@@ -197,7 +200,7 @@ class DQNConfig:
     env_id: str = "default"           # set per-environment at load time
     gym_id: str = "default"           # legacy field seen in your script — kept for compatibility
 
-    seed: int = 67
+    seed: int = seed
     torch_deterministic: bool = True
     cuda: bool = True
 
@@ -241,7 +244,7 @@ class RDQNConfig:
     algo_name: str = "dqn"
     env_id: str = "default"           # set per-environment at load time
     gym_id: str = "default"           # legacy field, kept for compatibility
-    seed: int = 67
+    seed: int = seed 
     torch_deterministic: bool = True
     cuda: bool = True
 
