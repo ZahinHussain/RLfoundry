@@ -57,7 +57,6 @@ def train(cfg, env, path):
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
 
     # ---- pre-allocated storage for one rollout's worth of data ----
-    # BipedalWalker: obs=(24,), actions=(4,)
     obs = torch.zeros((cfg.num_steps,) + env.observation_space.shape).to(device)
     actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
 
