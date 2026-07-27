@@ -91,6 +91,65 @@ def update_actor_params(agent, new_flat_params):
 # ==============================================================================
 # Training loop
 # ==============================================================================
+#
+# ALGORITHM 1 — Trust Region Policy Optimization — mapped onto this function.
+# (θ = actor params, φ = critic params, δ = target_kl, α = backtrack_coeff,
+#  K = backtrack_iters, D_k = one rollout batch, R̂_t = returns-to-go,
+#  Â_t = advantages, ĝ_k = policy gradient, Ĥ_k = Fisher/KL-Hessian,
+#  x̂_k = natural-gradient direction from conjugate gradient.)
+#
+#   for k = 0, 1, 2, ...                          -> the `for iteration in
+#                                                      range(1, num_iterations+1)`
+#                                                      loop below
+#
+#     1. collect trajectories D_k = {tau_i}       -> "Collect trajectories"
+#        by running the current policy pi_k          block: the inner
+#                                                      `for step in range(num_steps)`
+#                                                      rollout loop
+#
+#     2. compute rewards-to-go R_hat_t            -> "GAE" block: `returns =
+#                                                      advantages + values`
+#
+#     3. compute advantage estimates A_hat_t      -> "GAE" block: the
+#        from the current value function V_phi_k     reversed-time GAE loop
+#                                                      that fills `advantages`
+#
+#     4. estimate the policy gradient             -> "Actor update" block:
+#        g_hat_k = (1/|D_k|) sum grad log pi(a|s) * A_hat   `pg_loss`, then
+#                                                      `torch.autograd.grad(pg_loss, ...)`
+#                                                      -> `flat_pg_grad`
+#
+#     5. use conjugate gradient to compute         -> `conjugate_gradient(...)`
+#        x_hat_k ~= H_hat_k^{-1} g_hat_k              -> `step_dir`, using
+#        (H_hat_k = Hessian of mean KL)               `_fisher_vector_product`
+#                                                      as the implicit H_hat_k @ x
+#
+#     6. update the policy by backtracking line    -> the `for _ in range(
+#        search:                                      cfg.backtrack_iters)` loop:
+#          theta_{k+1} = theta_k                      `full_step = step_dir * step_size`
+#              + alpha^j * sqrt(2*delta / (x_hat^T     (step_size folds in the
+#                H_hat x_hat)) * x_hat_k                sqrt(2*delta / x^T H x) term),
+#        where j in {0,...,K} is the smallest step      then `fraction *= backtrack_coeff`
+#        that improves the sample loss and satisfies    shrinks alpha^j each retry;
+#        the sample KL constraint                        accept/reject is the
+#                                                        `kl <= target_kl and loss_improve > 0`
+#                                                        check
+#
+#     7. fit the value function by regression on   -> "Critic update" block,
+#        MSE against R_hat_t (typically several       run BEFORE the actor step
+#        steps of gradient descent)                    in code (order doesn't
+#                                                        matter — critic uses
+#                                                        b_returns from step 2/3,
+#                                                        not the updated actor)
+#
+#   end for
+#
+# One deviation from the pseudocode as written above: this file fits the critic
+# (step 7) before taking the actor step (steps 4-6), and gives the critic
+# several minibatch epochs per iteration rather than treating it as a single
+# regression call. Both are common, harmless reorderings — the critic fit only
+# depends on b_obs/b_returns, not on the actor update, so sequencing between
+# steps 4-6 and step 7 doesn't change what either optimizes.
 
 def train(cfg, env, path):
     path = run_startup(path, cfg)
@@ -142,7 +201,7 @@ def train(cfg, env, path):
     current_ep_length = 0
 
     # ========================================================================
-    # OUTER LOOP
+    # OUTER LOOP  (Algorithm 1, line 3: for k = 0, 1, 2, ...)
     # ========================================================================
     for iteration in range(1, cfg.num_iterations + 1):
 
@@ -151,7 +210,7 @@ def train(cfg, env, path):
             optimizer_critic.param_groups[0]["lr"] = frac * cfg.learning_rate
 
         # ====================================================================
-        # Collect trajectories
+        # Collect trajectories  (Algorithm 1, line 4)
         # ====================================================================
         for step in range(0, cfg.num_steps):
             global_step += 1
@@ -199,6 +258,7 @@ def train(cfg, env, path):
 
         # ====================================================================
         # GAE (Generalized Advantage Estimation)
+        # (Algorithm 1, lines 5-6: rewards-to-go R_hat_t and advantages A_hat_t)
         # ====================================================================
         with torch.no_grad():
             next_value = agent.get_value(next_obs).flatten()
@@ -235,6 +295,7 @@ def train(cfg, env, path):
 
         # ====================================================================
         # 1. Critic update — plain Adam regression, minibatched over epochs
+        # (Algorithm 1, line 10: fit V_phi by MSE regression on R_hat_t)
         # ====================================================================
         b_inds = np.arange(cfg.batch_size)
         v_loss = torch.tensor(0.0)
@@ -254,6 +315,8 @@ def train(cfg, env, path):
 
         # ====================================================================
         # 2. Actor update — single full-batch TRPO trust-region step
+        # (Algorithm 1, lines 7-9: policy gradient, conjugate gradient,
+        #  backtracking line search)
         # ====================================================================
         _, newlogprob, entropy, _ = agent.get_action_and_value(b_obs, b_actions)
         logratio = newlogprob - b_logprobs
@@ -263,17 +326,21 @@ def train(cfg, env, path):
             old_approx_kl = (-logratio).mean()
             approx_kl = ((ratio - 1) - logratio).mean()
 
+        # line 7: g_hat_k = (1/|D_k|) * sum grad_theta log pi_theta(a|s) * A_hat_t
         pg_loss = (b_advantages * ratio).mean()
         pg_grad = torch.autograd.grad(pg_loss, tuple(agent.actor_parameters()))
         flat_pg_grad = torch.cat([grad.contiguous().view(-1) for grad in pg_grad])
 
+        # line 8: x_hat_k ~= H_hat_k^{-1} g_hat_k, solved implicitly via CG +
+        # Fisher-vector products (never forming H_hat_k explicitly)
         step_dir = conjugate_gradient(agent, b_obs, flat_pg_grad, cfg.cg_iters, cfg.cg_damping)
         shs = torch.dot(step_dir, _fisher_vector_product(agent, b_obs, step_dir, cfg.cg_damping))
-        step_size = torch.sqrt(2 * cfg.target_kl / (shs + 1e-8))
+        step_size = torch.sqrt(2 * cfg.target_kl / (shs + 1e-8))  # sqrt(2*delta / x^T H x)
         full_step = step_dir * step_size
 
-        # Backtracking line search: shrink the step until both the KL bound
-        # and a genuine surrogate-objective improvement hold.
+        # line 9: theta_{k+1} = theta_k + alpha^j * step_size * x_hat_k,
+        # backtracking j = 0, 1, ..., K until the sample KL bound and a
+        # genuine surrogate-loss improvement both hold.
         old_params = flat_actor_params(agent)
         old_agent = copy.deepcopy(agent)
         expected_improve = (flat_pg_grad * full_step).sum().item()

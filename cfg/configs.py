@@ -283,6 +283,55 @@ class RDQNConfig:
     tau: float = 0.005                # used if "soft"
 
 
+@dataclass
+class TRPOConfig:
+    """
+    Config for trpo_train.py — one field per `cfg.xxx` access in that file.
+    Maps onto Algorithm 1 as: target_kl = delta, backtrack_coeff = alpha,
+    backtrack_iters = K, num_steps*num_envs per iteration = one D_k.
+    """
+
+    # --- run identity / tracking ---
+    algo_name: str = "trpo"
+    env_id: str = "Default"
+    seed: int = seed
+    cuda: bool = True
+    track: bool = True
+    wandb_project_name: str = "Default"
+    wandb_entity: str = ""
+    wandb_offline: bool = False
+    debug_episode_prints: bool = False
+
+    # --- rollout / iteration sizing ---
+    num_iterations: int = 500
+    num_steps: int = 2048
+    batch_size: int = 2048
+    minibatch_size: int = 64
+
+    # --- GAE / discounting ---
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    norm_adv: bool = True
+
+    # --- critic optimization ---
+    learning_rate: float = 3e-4
+    eps: float = 1e-5
+    critic_update_epochs: int = 10
+    max_grad_norm: float = 0.5
+    anneal_lr: bool = False
+
+    # --- TRPO trust-region step (Algorithm 1, lines 8-9) ---
+    target_kl: float = 0.01  # delta
+    cg_iters: int = 10
+    cg_damping: float = 0.1
+    backtrack_iters: int = 10  # K
+    backtrack_coeff: float = 0.8  # alpha
+
+    # --- checkpointing ---
+    interval_save: int = 60  # minutes
+
+
+
 # ============================================================================
 # Loader — this is the part that plugs into your existing code
 # ============================================================================
@@ -294,6 +343,7 @@ _CONFIGS = {
     "td3": TD3Config,
     "dqn": DQNConfig,
     "rdqn": RDQNConfig,
+    "trpo": TRPOConfig
 
 }
 
