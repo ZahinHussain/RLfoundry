@@ -16,7 +16,7 @@ from hydra.core.config_store import ConfigStore
 
 
 
-seed = 44
+seed = 67
 
 # ============================================================================
 # PPO
@@ -292,8 +292,10 @@ class TRPOConfig:
     """
 
     # --- run identity / tracking ---
+    exp_name: str = "trpo"
     algo_name: str = "trpo"
-    env_id: str = "Default"
+    env_id: str = "default"
+
     seed: int = seed
     cuda: bool = True
     track: bool = True
@@ -316,7 +318,7 @@ class TRPOConfig:
     # --- critic optimization ---
     learning_rate: float = 3e-4
     eps: float = 1e-5
-    critic_update_epochs: int = 10
+    update_epochs: int = 10
     max_grad_norm: float = 0.5
     anneal_lr: bool = False
 
@@ -329,8 +331,58 @@ class TRPOConfig:
 
     # --- checkpointing ---
     interval_save: int = 60  # minutes
+    clip_coef: float = 0.2
 
 
+@dataclass
+class CPOHVACConfig:
+    """
+    Config for cpo_train.py on SustainGym BuildingEnv - one field per
+    `cfg.xxx` access in that file. TRPOConfig plus four cost fields.
+    BuildingEnv is 1 day per episode at 5-min steps, so episode_len = 288
+    always, and every episode ends by truncation (never termination).
+    """
+    # --- run identity / tracking ---
+    exp_name: str = "cpo"
+    algo_name: str = "cpo"
+    env_id: str = "default"
+    seed: int = seed
+    cuda: bool = True
+    track: bool = True
+    wandb_project_name: str = "Default"
+    wandb_entity: str = ""
+    wandb_offline: bool = False
+    debug_episode_prints: bool = False
+
+    # --- rollout / iteration sizing ---
+    num_iterations: int = 500
+    num_steps: int = 2304  # 288 * 8 - keep it a multiple or mean_ep_len jitters
+    batch_size: int = 2304  # must equal num_steps
+    minibatch_size: int = 64
+    # --- GAE / discounting ---
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    norm_adv: bool = True  # reward advs only; cost advs are centre-only
+    # --- critic optimization (applies to BOTH critic heads) ---
+    learning_rate: float = 3e-4
+    eps: float = 1e-5
+    update_epochs: int = 10
+    max_grad_norm: float = 0.5
+    anneal_lr: bool = False
+    # --- CPO trust-region step ---
+    target_kl: float = 0.01  # delta
+    cg_iters: int = 10
+    cg_damping: float = 0.1
+    backtrack_iters: int = 10  # K
+    backtrack_coeff: float = 0.8  # alpha
+    # --- CPO constraint ---
+    cost_limit: float = 25.0  # PER EPISODE. SET FROM TRPO's episodic_cost x 0.5-0.7
+    cost_limit_anneal: float = 0.0  # 0.0 = paper-faithful; nonzero = curriculum hack
+    cost_gamma: float = 0.99
+    cost_gae_lambda: float = 0.95
+    # --- checkpointing ---
+    interval_save: int = 60  # minutes
+    clip_coef: float = 0.2  # clipfrac logging only; CPO clips nothing
 
 # ============================================================================
 # Loader — this is the part that plugs into your existing code
@@ -343,7 +395,8 @@ _CONFIGS = {
     "td3": TD3Config,
     "dqn": DQNConfig,
     "rdqn": RDQNConfig,
-    "trpo": TRPOConfig
+    "trpo": TRPOConfig,
+    "cpo": CPOHVACConfig
 
 }
 
