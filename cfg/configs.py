@@ -58,6 +58,12 @@ class PPOConfig:
     interval_save: int = 30
     eps: float = 1e-5
 
+    transfer_mode: str = "finetune"  # scratch | zeroshot | finetune | freeze
+    checkpoint_path: str | None = None
+    load_critic: bool = True
+    eval_episodes: int = 30
+    learning_rate: float = 1e-4  # lower than the 3e-4 source run
+
 
 # ============================================================================
 # RPO

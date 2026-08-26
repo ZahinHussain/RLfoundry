@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from gymnasium.wrappers import FlattenObservation
 from RLfoundry.PPO.Agent import Agent
 from RLfoundry.Utils.run_startup import run_startup
+from RLfoundry.Utils.transfer import load_pretrained, apply_freeze, evaluate, trainable_params
 
 _proc = psutil.Process()
 _proc.cpu_percent()  # warm-up call — first real reading needs a prior baseline
@@ -54,8 +55,31 @@ def train(cfg, env, path):
         device = torch.device("cpu")
 
     agent = Agent(env).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=cfg.eps)
 
+    skipped = []
+    if cfg.transfer_mode != "scratch":
+        assert cfg.checkpoint_path, "transfer_mode != scratch requires checkpoint_path"
+        _, skipped = load_pretrained(agent, cfg.checkpoint_path, device, cfg.load_critic)
+    if cfg.transfer_mode == "freeze":
+        apply_freeze(agent)
+
+    if cfg.track:
+        wandb.summary["transfer/mode"] = cfg.transfer_mode
+        wandb.summary["transfer/skipped_keys"] = skipped
+        wandb.summary["transfer/trainable_params"] = sum(p.numel() for p in trainable_params(agent))
+        wandb.summary["transfer/total_params"] = sum(p.numel() for p in agent.parameters())
+
+    if cfg.transfer_mode == "zeroshot":
+        rets, lens = evaluate(agent, env, cfg, device, cfg.eval_episodes)
+        if cfg.track:
+            for i, (r, l) in enumerate(zip(rets, lens)):
+                wandb.log({"charts/episodic_return": r, "charts/episodic_length": l}, step=i)
+        wandb.finish()
+        env.close()
+        return
+
+    params = trainable_params(agent)
+    optimizer = optim.Adam(params, lr=cfg.learning_rate, eps=cfg.eps)
     # ---- pre-allocated storage for one rollout's worth of data ----
     obs = torch.zeros((cfg.num_steps,) + env.observation_space.shape).to(device)
     actions = torch.zeros((cfg.num_steps,) + env.action_space.shape).to(device)
