@@ -70,11 +70,27 @@ def train(cfg, env, path):
         wandb.summary["transfer/total_params"] = sum(p.numel() for p in agent.parameters())
 
     if cfg.transfer_mode == "zeroshot":
-        rets, lens = evaluate(agent, env, cfg, device, cfg.eval_episodes)
+        all_rets, all_lens = [], []
+        for it in range(10):
+            rets, lens = evaluate(agent, env, cfg, device, cfg.eval_episodes)
+            all_rets.extend(rets)
+            all_lens.extend(lens)
+
+            mean_ret = float(np.mean(rets))
+            global_step = (it + 1) * cfg.num_steps * cfg.num_envs
+            print(f"[zeroshot] iter={it + 1}/10 return={mean_ret:.2f}", flush=True)
+
+            if cfg.track:
+                wandb.log({
+                    "charts/episodic_return": mean_ret,
+                    "charts/episodic_length": float(np.mean(lens)),
+                }, step=global_step)
+
+        print(f"[zeroshot] overall return {np.mean(all_rets):.2f} "
+              f"+/- {np.std(all_rets):.2f} over {len(all_rets)} episodes")
+
         if cfg.track:
-            for i, (r, l) in enumerate(zip(rets, lens)):
-                wandb.log({"charts/episodic_return": r, "charts/episodic_length": l}, step=i)
-        wandb.finish()
+            wandb.finish()
         env.close()
         return
 
@@ -248,25 +264,19 @@ def train(cfg, env, path):
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
                 optimizer.step()
 
+        if cfg.track:
+            log_ppo_step(
+                global_step, env, agent, rewards,
+                b_values, b_returns, pg_loss, v_loss, entropy_loss,
+                old_approx_kl, approx_kl, clipped_actions, obs,
+                optimizer, device,
+            )
+
 
 
         sps = int(global_step / (time.time() - start_time))
         print("SPS:", sps)
 
-        # ====================================================================
-        # LOGGING TO WANDB
-        # BUG FIX: this block previously ran unconditionally with no
-        # `cfg.track` guard, unlike every other algorithm file. Wrapped to
-        # match convention — if cfg.track=False, wandb.log should never be
-        # called at all.
-        # ====================================================================
-        if cfg.track:
-            log_ppo_step(
-                global_step,  env, agent, rewards,
-                b_values, b_returns, pg_loss, v_loss, entropy_loss,
-                old_approx_kl, approx_kl, clipped_actions, obs,
-                optimizer, device,
-            )
 
         # ====================================================================
         # CHECKPOINTING

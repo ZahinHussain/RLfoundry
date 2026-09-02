@@ -224,6 +224,9 @@ def train(cfg, env, path):
     cost_gae_lambda = float(cfg.get("cost_gae_lambda", cfg.gae_lambda))
     delta = float(cfg.target_kl)     # trust region radius, named for clarity
 
+
+
+
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
 
@@ -329,24 +332,24 @@ def train(cfg, env, path):
             current_ep_length += 1
 
             if next_done:
-                # ===== CPO CHANGE: harvest the episodic cost =====
                 ep_costs.append(current_ep_cost)
                 ep_lens.append(current_ep_length)
+                ep_info = info.get("episode")          # capture BEFORE reset
 
                 if getattr(cfg, "debug_episode_prints", False):
                     print(f"[episode end] global_step={global_step} "
                           f"return={current_ep_return:.2f} "
                           f"cost={current_ep_cost:.2f} length={current_ep_length}")
 
-                next_obs_np, info = env.reset()
+                next_obs_np, _reset_info = env.reset()   # don't shadow `info`
 
                 if cfg.track:
-                    ep_return = info["episode"]["r"] if "episode" in info else current_ep_return
-                    ep_length = info["episode"]["l"] if "episode" in info else current_ep_length
+                    ep_return = ep_info["r"] if ep_info is not None else current_ep_return
+                    ep_length = ep_info["l"] if ep_info is not None else current_ep_length
                     wandb.log({
                         "charts/episodic_return": ep_return,
                         "charts/episodic_length": ep_length,
-                        "charts/episodic_cost": current_ep_cost,   # CPO CHANGE
+                        "charts/episodic_cost": current_ep_cost,
                     }, step=global_step)
 
                 current_ep_return = 0.0
@@ -572,32 +575,43 @@ def train(cfg, env, path):
             if not backtrack_success:
                 update_actor_params(agent, old_params)
                 fraction = 0.0
-        _n = max(len(ep_costs), 1)
         sps = int(global_step / (time.time() - start_time))
-        print(f"SPS: {sps}  optim_case={sol['optim_case']}  c={c:+.4f}  frac={fraction:.4f}")
-        print(f"[iter {iteration:>4d}]  energy {iter_energy / _n:>10.2f}"
-              f"  comfort {iter_comfort / _n:>10.2f}"
-              f"  total {iter_total / _n:>10.2f}")
+        print(f"[iter {iteration:>4d}]"
+              f"  energy/step {iter_energy / cfg.num_steps:>11.5f}"
+              f"  comfort/step {iter_comfort / cfg.num_steps:>11.5f}"
+              f"  ep_cost {J_C:>10.1f} / {cost_limit:>8.1f}")
 
         # ====================================================================
         # LOGGING
         # ====================================================================
         if cfg.track:
-            _n = max(len(ep_costs), 1)
+            _n_eps = cfg.num_steps / max(mean_ep_len, 1.0)
+            _denom = abs(iter_energy) + abs(iter_comfort) + 1e-8
+            _violation = max(0.0, J_C - cost_limit)
+            # single scalar: episodic return minus a penalty on budget overrun.
+            # reward and cost are in different units, so score_penalty is an
+            # exchange rate you pick, not something the CMDP gives you.
+            _combined = (iter_total / _n_eps)
+
             wandb.log({
-                "rewards/ep_energy": iter_energy / _n,
-                "rewards/ep_comfort": iter_comfort / _n,
-                "rewards/ep_total": iter_total / _n,
-                "rewards/energy_share": iter_energy / (iter_total + 1e-8),
+                "rewards/ep_energy": iter_energy / _n_eps,
+                "rewards/ep_comfort": iter_comfort / _n_eps,
+                "rewards/ep_total": iter_total / _n_eps,
                 "rewards/step_energy": iter_energy / cfg.num_steps,
                 "rewards/step_comfort": iter_comfort / cfg.num_steps,
+                "rewards/energy_share": abs(iter_energy) / _denom,
+                "rewards/comfort_share": abs(iter_comfort) / _denom,
+                # ---- combined reward + safety views ----
+                "charts/combined_score": _combined,
+                "charts/constraint_violation": _violation,
+                "losses/critic_combined": (v_loss + vc_loss).item(),
             }, step=global_step)
             log_cpo_step(
                 global_step, env, agent, rewards, costs,
                 b_values, b_returns, b_cost_values, b_cost_returns,
                 pg_loss, v_loss, vc_loss, cost_surr, entropy,
                 old_approx_kl, approx_kl, kl,
-                fraction, expected_improve, clipfrac,
+              fraction, expected_improve, clipfrac,
                 sol, c, J_C, cost_limit, loss_improve, cost_improve,
                 clipped_actions, obs, optimizer_critic, optimizer_cost_critic, device,
             )

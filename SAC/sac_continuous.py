@@ -16,7 +16,16 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
 from RLfoundry.Utils.Buffer.Buffer import ReplayBuffer
+
 from RLfoundry.SAC.SACNetwork import Actor, SoftQNetwork
+
+
+
+
+from RLfoundry.Utils.transfer_sac import (
+    load_pretrained_sac, apply_freeze_sac, evaluate_sac,
+    trainable_params_multi, count_params,
+)
 
 from RLfoundry.Utils.run_startup import run_startup
 
@@ -54,28 +63,71 @@ def train(cfg, env, path):
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
 
+    if torch.cuda.is_available() and cfg.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        # Cude and device setup
+        device = torch.device("cpu")
+
     # ------------------------------------------------------------------
     # Seeding
-    # ------------------------------------------------------------------
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    torch.backends.cudnn.deterministic = cfg.torch_deterministic
-
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
-
-    # ------------------------------------------------------------------
-    # Networks
-    # Actor + twin Q-networks + target networks (SAC uses two Q-networks
-    # to reduce overestimation bias; targets are updated via Polyak averaging)
     # ------------------------------------------------------------------
     actor = Actor(env).to(device)
     qf1 = SoftQNetwork(env).to(device)
     qf2 = SoftQNetwork(env).to(device)
     qf1_target = SoftQNetwork(env).to(device)
     qf2_target = SoftQNetwork(env).to(device)
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
+
+    skipped, ckpt_log_alpha = [], None
+    if cfg.transfer_mode != "scratch":
+        assert cfg.checkpoint_path, "transfer_mode != scratch requires checkpoint_path"
+        _, skipped, ckpt_log_alpha = load_pretrained_sac(
+            actor, qf1, qf2, qf1_target, qf2_target,
+            cfg.checkpoint_path, device,
+            load_critic=cfg.load_critic,
+            load_alpha=cfg.get("load_alpha", False),
+        )
+    else:
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+
+    if cfg.transfer_mode == "freeze":
+        apply_freeze_sac(actor, qf1, qf2, freeze_critic=cfg.load_critic)
+
+    if cfg.track:
+        trainable, total = count_params(actor, qf1, qf2)
+        wandb.summary["transfer/mode"] = cfg.transfer_mode
+        wandb.summary["transfer/skipped_keys"] = skipped
+        wandb.summary["transfer/trainable_params"] = trainable
+        wandb.summary["transfer/total_params"] = total
+
+    if cfg.transfer_mode == "zeroshot":
+        all_rets, all_lens = [], []
+        for it in range(10):
+            rets, lens = evaluate_sac(actor, env, cfg, device, cfg.eval_episodes)
+            all_rets.extend(rets)
+            all_lens.extend(lens)
+
+            mean_ret = float(np.mean(rets))
+            global_step = (it + 1) * cfg.eval_episodes
+            print(f"[zeroshot] iter={it + 1}/10 return={mean_ret:.2f}", flush=True)
+
+            if cfg.track:
+                wandb.log({
+                    "charts/episodic_return": mean_ret,
+                    "charts/episodic_length": float(np.mean(lens)),
+                }, step=global_step)
+
+        print(f"[zeroshot] overall return {np.mean(all_rets):.2f} "
+              f"+/- {np.std(all_rets):.2f} over {len(all_rets)} episodes")
+
+        if cfg.track:
+            wandb.finish()
+        env.close()
+        return
+
 
     # Separate optimizers: one for both Q-networks, one for the actor
     q_optimizer = optim.Adam(

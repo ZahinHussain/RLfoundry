@@ -1,6 +1,20 @@
 # Discrete-action SAC. Adapted from the continuous training file.
 # Reference: Christodoulou (2019), "Soft Actor-Critic for Discrete Action
 # Settings" (arXiv:1910.07207) and CleanRL's sac_atari.py.
+#
+# LOGGING NOTE: the wandb schema below is deliberately key-compatible with
+# the PPO file so runs can be overlaid on the same panels. Shared keys:
+#   charts/episodic_return, charts/episodic_length, charts/learning_rate
+#   rewards/mean
+#   losses/policy_loss, losses/value_loss, losses/entropy,
+#   losses/explained_variance
+#   actions_mean/aggregate, actions_std/aggregate,
+#   actions_mean/action_{i}_frac
+#   observations_mean/*, observations_std/*
+#   system/SPS, system/grad_norm, system/obs_has_nan_or_inf
+#   cpu/*, cpu_percore/*, ram/*, gpu/*
+# SAC-only metrics keep their own namespaces (losses/qf*_loss, losses/alpha*,
+# actions_probs/*) so they never collide with a PPO panel.
 import os
 import random
 import time
@@ -63,6 +77,11 @@ def train(cfg, env, path):
 
     SAVE_INTERVAL_SECONDS = int(cfg.interval_save) * 60
     last_numpy_save_t = time.time()
+
+    # PPO logs once per iteration (every cfg.num_steps env steps); this file
+    # would otherwise log on every update, which is far denser. 0 keeps the
+    # old behaviour (log on every policy update).
+    log_interval = int(cfg.get("log_interval", 0))
 
     # ------------------------------------------------------------------
     # Seeding
@@ -132,6 +151,13 @@ def train(cfg, env, path):
 
     start_time = time.time()
 
+    # Manual episode accounting. Mirrors the PPO file: if the env is not
+    # wrapped in RecordEpisodeStatistics there is no infos["episode"], and
+    # charts/episodic_return would silently never appear - which is exactly
+    # the panel the two runs need to share.
+    current_ep_return = 0.0
+    current_ep_length = 0
+
     # ==================================================================
     # Main loop
     # ==================================================================
@@ -156,19 +182,8 @@ def train(cfg, env, path):
         # --------------------------------------------------------------
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
 
-        # Log episodic returns when an episode finishes
-        # NOTE: no `break` here - training must continue past episode boundaries.
-        if "episode" in infos:
-            ep_return = infos["episode"]["r"]
-            ep_length = infos["episode"]["l"]
-            print(f"global_step={global_step}, episodic_return={ep_return}")
-            episodic_return_history.append(ep_return)
-
-            if cfg.track:
-                wandb.log({
-                    "charts/episodic_return": ep_return,
-                    "charts/episodic_length": ep_length,
-                }, step=global_step)
+        current_ep_return += float(rewards)
+        current_ep_length += 1
 
         # ----------------------------------------------------------------
         # Single (non-vectorized) env: `next_obs` from env.step() IS already
@@ -186,8 +201,26 @@ def train(cfg, env, path):
             [infos],  # dict -> [dict]
         )
 
-        # Reset on episode end, otherwise carry the obs forward
+        # --------------------------------------------------------------
+        # Episode end: log returns, then reset. Otherwise carry obs forward.
+        # NOTE: no `break` here - training must continue past episode ends.
+        # --------------------------------------------------------------
         if terminations or truncations:
+            ep_return = infos["episode"]["r"] if "episode" in infos else current_ep_return
+            ep_length = infos["episode"]["l"] if "episode" in infos else current_ep_length
+
+            print(f"global_step={global_step}, episodic_return={ep_return}")
+            episodic_return_history.append(ep_return)
+
+            if cfg.track:
+                wandb.log({
+                    "charts/episodic_return": ep_return,
+                    "charts/episodic_length": ep_length,
+                }, step=global_step)
+
+            current_ep_return = 0.0
+            current_ep_length = 0
+
             obs, _ = env.reset()
         else:
             obs = next_obs
@@ -232,6 +265,12 @@ def train(cfg, env, path):
 
             q_optimizer.zero_grad()
             qf_loss.backward()
+            # max_norm=inf measures the norm without clipping anything, so
+            # system/grad_norm is comparable to PPO's without changing SAC's
+            # update rule (PPO clips at cfg.max_grad_norm; SAC does not).
+            q_grad_norm = nn.utils.clip_grad_norm_(
+                list(qf1.parameters()) + list(qf2.parameters()), float("inf")
+            )
             q_optimizer.step()
 
             # ----------------------------------------------------------
@@ -258,6 +297,9 @@ def train(cfg, env, path):
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
+                    actor_grad_norm = nn.utils.clip_grad_norm_(
+                        actor.parameters(), float("inf")
+                    )
                     actor_optimizer.step()
 
                     # alpha_loss must exist even when cfg.autotune is False,
@@ -283,14 +325,20 @@ def train(cfg, env, path):
                 qf1_loss_history.append(qf1_loss.item())
                 actor_loss_history.append(actor_loss.item())
 
-                if cfg.track:
+                sps = int(global_step / (time.time() - start_time))
+
+                should_log = log_interval <= 0 or global_step % log_interval == 0
+                if cfg.track and should_log:
                     log_sac_step(
                         global_step, env, data, action_probs,
                         qf1_a_values, next_q_value,
                         actor_loss, qf1_loss, qf2_loss, qf_loss,
                         alpha, log_pi, cfg.autotune, alpha_loss,
                         actor_optimizer, q_optimizer, device,
-                        log_per_dim_obs=bool(cfg.get("log_per_dim_obs", False)),
+                        sps=sps,
+                        actor_grad_norm=actor_grad_norm,
+                        q_grad_norm=q_grad_norm,
+                        log_per_dim_obs=bool(cfg.get("log_per_dim_obs", True)),
                     )
 
             # ----------------------------------------------------------
@@ -330,8 +378,7 @@ def train(cfg, env, path):
                 )
                 last_numpy_save_t = now
 
-            sps = int(global_step / (time.time() - start_time))
-            print("SPS:", sps)
+            print("SPS:", int(global_step / (time.time() - start_time)))
 
     # ======================================================================
     # Final checkpoint - runs ONCE, after the loop finishes
@@ -414,6 +461,8 @@ def save_checkpoint(
 
 # ==============================================================================
 # Logging subroutine
+#
+# Section numbering mirrors log_ppo_step so the two are diffable.
 # ==============================================================================
 
 def log_sac_step(
@@ -422,12 +471,21 @@ def log_sac_step(
     actor_loss, qf1_loss, qf2_loss, qf_loss,
     alpha, log_pi, autotune, alpha_loss,
     actor_optimizer, q_optimizer, device,
-    log_per_dim_obs=False,
+    sps=None,
+    actor_grad_norm=None,
+    q_grad_norm=None,
+    log_per_dim_obs=True,
 ):
     log_dict = {}
 
+    # ------------------------------------------------------------------
+    # 1. REWARDS
+    # ------------------------------------------------------------------
     log_dict["rewards/mean"] = data.rewards.mean().item()
 
+    # ------------------------------------------------------------------
+    # 2. LOSSES
+    # ------------------------------------------------------------------
     y_pred = qf1_a_values.detach().cpu().numpy()
     y_true = next_q_value.detach().cpu().numpy()
     var_y = np.var(y_true)
@@ -436,71 +494,137 @@ def log_sac_step(
     # Entropy must be weighted by pi: log_pi now holds log-probs for ALL
     # actions, so the continuous version's (-log_pi).mean() would average
     # over the whole action set instead of taking the policy expectation.
+    # This is the same quantity PPO logs as losses/entropy (nats).
     entropy = -(action_probs * log_pi).sum(dim=1)
 
+    # PPO-comparable aliases. policy_loss <- actor_loss; value_loss <-
+    # qf1_loss (single-critic MSE, closest in scale to PPO's 0.5*MSE;
+    # qf_loss is the sum over both critics and so runs ~2x higher).
+    log_dict.update({
+        "losses/policy_loss": actor_loss.item(),
+        "losses/value_loss": qf1_loss.item(),
+        "losses/entropy": entropy.mean().item(),
+        "losses/explained_variance": explained_var,
+    })
+
+    # SAC-native losses (no PPO counterpart, own keys)
     log_dict.update({
         "losses/actor_loss": actor_loss.item(),
         "losses/qf1_loss": qf1_loss.item(),
         "losses/qf2_loss": qf2_loss.item(),
         "losses/qf_loss": qf_loss.item(),
         "losses/alpha": alpha,
-        "losses/entropy": entropy.mean().item(),
-        "losses/explained_variance": explained_var,
     })
     if autotune and alpha_loss is not None:
         log_dict["losses/alpha_loss"] = alpha_loss.item()
 
     # ------------------------------------------------------------------
-    # Action distribution stats (discrete replacements)
-    # There are no action dimensions to average, and no clip bounds to
-    # saturate against, so the per-dim mean/std and frac_at_clip_bounds
-    # metrics from the continuous file have no discrete analogue. What
-    # matters instead is the shape of the categorical distribution.
+    # 3. ACTIONS (Discrete)
+    # Same computation as PPO: empirical stats over the integer actions in
+    # the batch. Caveat when reading the panel - PPO's batch is the current
+    # on-policy rollout, this one is a replay sample, so it mixes actions
+    # from older policies and lags PPO's version of the same curve.
+    # ------------------------------------------------------------------
+    actions_np = data.actions.detach().cpu().numpy().flatten().astype(np.int64)
+    log_dict["actions_mean/aggregate"] = float(actions_np.mean())
+    log_dict["actions_std/aggregate"] = float(actions_np.std())
+
+    num_actions = int(env.action_space.n)
+    action_counts = np.bincount(actions_np, minlength=num_actions)
+    action_frac = action_counts / max(action_counts.sum(), 1)
+
+    for a_idx in range(num_actions):
+        log_dict[f"actions_mean/action_{a_idx}_frac"] = float(action_frac[a_idx])
+
+    # ------------------------------------------------------------------
+    # 3b. ACTION DISTRIBUTION (SAC-only, separate namespace)
+    # PPO only sees sampled actions; here the full categorical is available,
+    # so these go under actions_probs/ rather than overwriting the shared
+    # actions_mean/ and actions_std/ keys above with a different quantity.
     # ------------------------------------------------------------------
     probs_np = action_probs.detach().cpu().numpy()
     prob_means = probs_np.mean(axis=0)
     prob_stds = probs_np.std(axis=0)
     max_probs = probs_np.max(axis=1)
 
-    log_dict["actions_mean/entropy"] = float(entropy.mean().item())
-    log_dict["actions_mean/entropy_uniform"] = float(np.log(probs_np.shape[-1]))
+    log_dict["actions_probs/entropy"] = float(entropy.mean().item())
+    log_dict["actions_probs/entropy_uniform"] = float(np.log(probs_np.shape[-1]))
     for a_idx in range(probs_np.shape[-1]):
-        log_dict[f"actions_mean/prob_a{a_idx}"] = float(prob_means[a_idx])
+        log_dict[f"actions_probs/prob_a{a_idx}"] = float(prob_means[a_idx])
 
     log_dict.update({
         # Spread of each action's probability across the batch: near zero
         # means the policy is state-independent (collapsed).
-        "actions_std/aggregate": float(prob_stds.mean()),
-        "actions_std/min": float(prob_stds.min()),
-        "actions_std/max": float(prob_stds.max()),
+        "actions_probs/std_aggregate": float(prob_stds.mean()),
+        "actions_probs/std_min": float(prob_stds.min()),
+        "actions_probs/std_max": float(prob_stds.max()),
         # Determinism proxy - the discrete stand-in for frac_at_clip_bounds.
-        "actions_std/max_prob_mean": float(max_probs.mean()),
-        "actions_std/frac_near_deterministic": float(np.mean(max_probs > 0.99)),
+        "actions_probs/max_prob_mean": float(max_probs.mean()),
+        "actions_probs/frac_near_deterministic": float(np.mean(max_probs > 0.99)),
     })
     for a_idx, std_val in enumerate(prob_stds):
-        log_dict[f"actions_std/a{a_idx}"] = float(std_val)
+        log_dict[f"actions_probs/std_a{a_idx}"] = float(std_val)
 
+    # ------------------------------------------------------------------
+    # 4. OBSERVATIONS
+    # ------------------------------------------------------------------
     obs_np = data.observations.detach().cpu().numpy()
     obs_flat = obs_np.reshape(obs_np.shape[0], -1)
 
-    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
-    log_dict["observations_std/aggregate"] = float(obs_np.std())
+    obs_dim_means = obs_flat.mean(axis=0)
+    obs_dim_stds = obs_flat.std(axis=0)
 
-    # Gated: a one-hot tabular env writes two scalars per observation
-    # dimension per log call, which is thousands of series for a 716-dim obs.
+    log_dict["observations_mean/aggregate"] = float(obs_np.mean())
+
+    # Per-dim series, same as PPO. On by default so the two runs share every
+    # observations_mean/dim* and observations_std/dim* panel. A one-hot
+    # tabular env writes two scalars per obs dimension per log call, so on a
+    # 716-dim obs this is ~1.4k series - set log_per_dim_obs=false in the
+    # config if a run gets too heavy (PPO would need the same treatment).
     if log_per_dim_obs:
-        obs_dim_means = obs_flat.mean(axis=0)
-        obs_dim_stds = obs_flat.std(axis=0)
         for dim_idx in range(obs_flat.shape[-1]):
             log_dict[f"observations_mean/dim{dim_idx}"] = float(obs_dim_means[dim_idx])
+
+    log_dict["observations_std/aggregate"] = float(obs_np.std())
+
+    if log_per_dim_obs:
+        for dim_idx in range(obs_flat.shape[-1]):
             log_dict[f"observations_std/dim{dim_idx}"] = float(obs_dim_stds[dim_idx])
 
+    obs_has_nan_or_inf = bool(np.isnan(obs_np).any() or np.isinf(obs_np).any())
+
+    # ------------------------------------------------------------------
+    # 5. TRAINING
+    # system/grad_norm is the actor's norm, so it lines up with PPO's
+    # (which is the norm over the whole actor-critic agent, policy included).
+    # The critic norm is kept alongside under its own key.
+    # ------------------------------------------------------------------
+    def _as_float(x):
+        if x is None:
+            return None
+        return x.item() if torch.is_tensor(x) else float(x)
+
+    if sps is not None:
+        log_dict["system/SPS"] = int(sps)
+    if actor_grad_norm is not None:
+        log_dict["system/grad_norm"] = _as_float(actor_grad_norm)
+        log_dict["system/grad_norm_actor"] = _as_float(actor_grad_norm)
+    if q_grad_norm is not None:
+        log_dict["system/grad_norm_q"] = _as_float(q_grad_norm)
+
+    log_dict["system/obs_has_nan_or_inf"] = int(obs_has_nan_or_inf)
+
+    # PPO has a single optimizer, so charts/learning_rate is the shared key;
+    # the two SAC-specific rates keep their existing names.
     log_dict.update({
+        "charts/learning_rate": actor_optimizer.param_groups[0]["lr"],
         "charts/learning_rate_actor": actor_optimizer.param_groups[0]["lr"],
         "charts/learning_rate_q": q_optimizer.param_groups[0]["lr"],
     })
 
-    # --- CPU (separate panel group) ---
+    # ------------------------------------------------------------------
+    # 6. CPU
+    # ------------------------------------------------------------------
     per_core = psutil.cpu_percent(percpu=True)
 
     log_dict.update({
@@ -515,7 +639,9 @@ def log_sac_step(
     for core_idx, core_pct in enumerate(per_core):
         log_dict[f"cpu_percore/core{core_idx}"] = core_pct
 
-    # --- RAM (separate panel group) ---
+    # ------------------------------------------------------------------
+    # 7. RAM
+    # ------------------------------------------------------------------
     log_dict.update({
         "ram/proc_used_gb": _proc.memory_info().rss / (1024 ** 3),
         "ram/sys_percent": psutil.virtual_memory().percent,
@@ -530,7 +656,9 @@ def log_sac_step(
     except (AttributeError, NotImplementedError):
         pass  # io_counters not available on macOS
 
-    # --- GPU (separate panel group) ---
+    # ------------------------------------------------------------------
+    # 8. GPU
+    # ------------------------------------------------------------------
     if device.type == "cuda":
         log_dict.update({
             "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),

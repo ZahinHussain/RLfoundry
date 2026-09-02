@@ -34,6 +34,7 @@ class PPOConfig:
     total_timesteps: int = 1_024_000
     torch_deterministic: bool = True
 
+
     track: bool = True
     wandb_project_name: str = "default"
     wandb_entity: Optional[str] = None
@@ -106,6 +107,11 @@ class RPOConfig:
     rpo_alpha: float = 0.5
     cuda: bool = True
 
+    transfer_mode: str = "finetune"  # scratch | zeroshot | finetune | freeze
+    checkpoint_path: str | None = None
+    load_critic: bool = True
+    eval_episodes: int = 30
+
 
 # ============================================================================
 # SAC
@@ -147,6 +153,12 @@ class SACConfig:
     autotune: bool = True
 
     interval_save: int = 30
+
+    transfer_mode: str = "finetune"  # scratch | zeroshot | finetune | freeze
+    checkpoint_path: str | None = None
+    load_critic: bool = True
+    eval_episodes: int = 30
+
 
 
 # ============================================================================
@@ -361,10 +373,12 @@ class CPOHVACConfig:
     debug_episode_prints: bool = False
 
     # --- rollout / iteration sizing ---
+
     num_iterations: int = 500
-    num_steps: int = 2304  # 288 * 8 - keep it a multiple or mean_ep_len jitters
-    batch_size: int = 2304  # must equal num_steps
+    num_steps: int = 2048
+    batch_size: int = 2048
     minibatch_size: int = 64
+
     # --- GAE / discounting ---
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -382,7 +396,7 @@ class CPOHVACConfig:
     backtrack_iters: int = 10  # K
     backtrack_coeff: float = 0.8  # alpha
     # --- CPO constraint ---
-    cost_limit: float = 25.0  # PER EPISODE. SET FROM TRPO's episodic_cost x 0.5-0.7
+    cost_limit: float = 1
     cost_limit_anneal: float = 0.0  # 0.0 = paper-faithful; nonzero = curriculum hack
     cost_gamma: float = 0.99
     cost_gae_lambda: float = 0.95
